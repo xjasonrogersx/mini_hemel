@@ -8,6 +8,7 @@ from datetime import datetime
 import io
 import logging
 from pathlib import Path
+import time
 from typing import Any
 
 import numpy as np
@@ -31,6 +32,9 @@ class CarSegmentationViewer(SceneViewer):
         visdrone_model_path: str,
         confidence: float,
         screenshot_dir: Path,
+        diffusion_model: str,
+        diffusion_steps: int,
+        diffusion_strength: float,
     ) -> None:
         self.segmentation_model_path = model_path
         self.segmentation_confidence = confidence
@@ -43,12 +47,17 @@ class CarSegmentationViewer(SceneViewer):
         self.segformer_processor: Any = None
         self.segformer_device: Any = None
         self.visdrone_model_path = visdrone_model_path
+        self.diffusion_model_path = diffusion_model
+        self.diffusion_steps = diffusion_steps
+        self.diffusion_strength = diffusion_strength
+        self.diffusion_pipeline: Any = None
         self.visdrone_model: Any = None
         self.highlight_geometry: list[str] = []
         self.detected_car_triangles: list[np.ndarray] = []
         self.detected_face_records: list[tuple[str, str, np.ndarray]] = []
         self._top_down = False
         self._normal_camera_transform = scene.camera_transform.copy()
+        self._last_left_click: tuple[float, float, float] | None = None
         super().__init__(
             scene,
             background=(0, 0, 0, 255),
@@ -58,12 +67,69 @@ class CarSegmentationViewer(SceneViewer):
             ),
         )
 
+    def on_mouse_press(self, x: int, y: int, buttons: int, modifiers: int) -> None:
+        import pyglet
+
+        now = time.monotonic()
+        last_click = self._last_left_click
+        is_double_click = (
+            buttons == pyglet.window.mouse.LEFT
+            and last_click is not None
+            and now - last_click[0] <= 0.35
+            and (x - last_click[1]) ** 2 + (y - last_click[2]) ** 2 <= 64
+        )
+        if buttons == pyglet.window.mouse.LEFT:
+            self._last_left_click = (now, float(x), float(y))
+        else:
+            self._last_left_click = None
+
+        super().on_mouse_press(x, y, buttons, modifiers)
+        if is_double_click:
+            self._move_camera_above_click(x, y)
+
+    def _move_camera_above_click(self, x: int, y: int) -> None:
+        origins, directions, pixels = self.scene.camera_rays()
+        width, height = map(int, self.scene.camera.resolution)
+        pixel = np.array([height - 1 - int(y), int(x)])
+        matches = np.flatnonzero(np.all(pixels == pixel, axis=1))
+        if not len(matches):
+            self.set_caption("Could not find the clicked camera ray")
+            return
+
+        ray_index = int(matches[0])
+        origin = origins[ray_index]
+        direction = directions[ray_index]
+        street_y = float(self.scene.bounds[0, 1])
+        if abs(direction[1]) < 1e-8:
+            self.set_caption("Clicked ray does not intersect the street plane")
+            return
+
+        distance = (street_y - origin[1]) / direction[1]
+        if distance <= 0:
+            self.set_caption("Clicked street point is behind the camera")
+            return
+
+        street_point = origin + direction * distance
+        camera_transform = self.scene.camera_transform.copy()
+        camera_transform[:3, 3] = street_point + np.array([0.0, 1.5, 0.0])
+        self.scene.camera_transform = camera_transform
+        self.view["ball"]._pose = camera_transform
+        self.view["ball"]._n_pose = camera_transform
+        self._redraw()
+        self.set_caption(
+            "Camera moved to %.2f, %.2f, %.2f"
+            % tuple(camera_transform[:3, 3])
+        )
+
     def on_key_press(self, symbol: int, modifiers: int) -> None:
         if symbol == self._key("Q"):
             self.segment_cars()
             return
         if symbol == self._key("S"):
             self.save_current_view()
+            return
+        if symbol == self._key("A"):
+            self.enhance_current_view()
             return
         if symbol == self._key("G"):
             self.toggle_top_down_view()
@@ -104,6 +170,68 @@ class CarSegmentationViewer(SceneViewer):
             self.set_caption(f"Trimesh SceneViewer (saved: {output_path.name})")
         except Exception:
             LOGGER.exception("Failed to save current view")
+
+    def _load_diffusion_pipeline(self) -> Any:
+        if self.diffusion_pipeline is None:
+            try:
+                import torch
+                from diffusers import StableDiffusion3Img2ImgPipeline
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Stable Diffusion enhancement requires diffusers. "
+                    "Install it with: pip install diffusers"
+                ) from exc
+
+            LOGGER.info("Loading Stable Diffusion 3.5 model: %s", self.diffusion_model_path)
+            self.diffusion_pipeline = StableDiffusion3Img2ImgPipeline.from_pretrained(
+                self.diffusion_model_path,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                low_cpu_mem_usage=True,
+            )
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if device == "cuda":
+                self.diffusion_pipeline.enable_model_cpu_offload()
+            else:
+                self.diffusion_pipeline.to(device)
+                self.diffusion_pipeline.enable_attention_slicing()
+            LOGGER.info("Stable Diffusion 3.5 loaded on %s", device)
+        return self.diffusion_pipeline
+
+    def enhance_current_view(self) -> None:
+        try:
+            import torch
+
+            image = Image.fromarray(self._capture_view()).convert("RGB")
+            self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            input_path = self.screenshot_dir / f"view_a_input_{timestamp}.png"
+            output_path = self.screenshot_dir / f"view_a_enhanced_{timestamp}.png"
+            image.save(input_path)
+            self.set_caption("Enhancing view with Stable Diffusion 3.5...")
+            pipeline = self._load_diffusion_pipeline()
+            generator = torch.Generator(device=pipeline.device).manual_seed(0)
+            enhanced = pipeline(
+                prompt=(
+                    "high quality photorealistic street-level 3D reconstruction, "
+                    "sharp details, natural lighting, preserve the exact geometry "
+                    "and composition of the input image"
+                ),
+                negative_prompt=(
+                    "changed camera angle, changed buildings, changed cars, "
+                    "warped geometry, extra objects, text, watermark, blur"
+                ),
+                image=image,
+                strength=self.diffusion_strength,
+                num_inference_steps=self.diffusion_steps,
+                guidance_scale=4.5,
+                generator=generator,
+            ).images[0]
+            enhanced.save(output_path)
+            LOGGER.info("Saved enhanced view to %s", output_path)
+            self.set_caption(f"Enhanced view saved: {output_path.name}")
+        except Exception as exc:
+            self.set_caption(f"Stable Diffusion enhancement failed: {exc}")
+            LOGGER.exception("Stable Diffusion enhancement failed")
 
     def _load_segmentation_model(self) -> Any:
         if self.segmentation_model is None:
@@ -389,10 +517,6 @@ class CarSegmentationViewer(SceneViewer):
             self.set_caption("No valid car triangles to flatten")
             return
 
-        road_y = min(
-            float(triangles[:, :, 1].min())
-            for triangles in selected_world_triangles
-        )
         flattened_count = 0
         for record_index, (
             node_name,
@@ -422,8 +546,12 @@ class CarSegmentationViewer(SceneViewer):
                 self.highlight_geometry.append(remainder_name)
             world_vertices = transform_points(geometry.vertices, transform)
             selected_triangles = world_vertices[geometry.faces[selected]].copy()
-            selected_triangles = world_vertices[geometry.faces[selected]].copy()
-            selected_triangles[:, :, 1] = road_y
+            inside_indices = np.argmax(selected_triangles[:, :, 1], axis=1)
+            triangle_indices = np.arange(len(selected_triangles))
+            outside_mask = np.ones(selected_triangles.shape[:2], dtype=bool)
+            outside_mask[triangle_indices, inside_indices] = False
+            outside_y = selected_triangles[:, :, 1][outside_mask].reshape(-1, 2)
+            selected_triangles[triangle_indices, inside_indices, 1] = outside_y.mean(axis=1)
             flattened = trimesh.Trimesh(
                 vertices=selected_triangles.reshape(-1, 3),
                 faces=np.arange(len(selected_triangles) * 3).reshape(-1, 3),
@@ -443,9 +571,8 @@ class CarSegmentationViewer(SceneViewer):
         self._redraw()
         LOGGER.info(
             "Replaced %d detected car triangles with grey geometry flattened "
-            "to shared road level Y=%.6f",
+            "to the average Y of each triangle's outside vertices",
             flattened_count,
-            road_y,
         )
         self.set_caption(f"Flattened grey cars: {flattened_count} triangles")
 
@@ -635,6 +762,26 @@ def main() -> None:
         default=Path("captures"),
         help="directory for S and Q screenshots (default: captures)",
     )
+    parser.add_argument(
+        "--diffusion-model",
+        default="stabilityai/stable-diffusion-3.5-medium",
+        help=(
+            "Stable Diffusion image-to-image model "
+            "(default: stabilityai/stable-diffusion-3.5-medium)"
+        ),
+    )
+    parser.add_argument(
+        "--diffusion-steps",
+        type=int,
+        default=30,
+        help="Stable Diffusion enhancement steps (default: 30)",
+    )
+    parser.add_argument(
+        "--diffusion-strength",
+        type=float,
+        default=0.2,
+        help="Stable Diffusion image change strength from 0 to 1 (default: 0.2)",
+    )
     args = parser.parse_args()
 
     if not args.model.is_file():
@@ -650,6 +797,9 @@ def main() -> None:
         visdrone_model_path=args.visdrone_model,
         confidence=args.confidence,
         screenshot_dir=args.screenshot_dir,
+        diffusion_model=args.diffusion_model,
+        diffusion_steps=args.diffusion_steps,
+        diffusion_strength=args.diffusion_strength,
     )
 
 

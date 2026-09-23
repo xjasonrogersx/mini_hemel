@@ -5,3 +5,6 @@ trimesh
 torch
 transformers
 ultralytics
+scipy
+diffusers
+accelerate
