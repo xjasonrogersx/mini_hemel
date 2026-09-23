@@ -1,0 +1,7 @@
+numpy
+Pillow
+pyglet>=1.5,<2
+trimesh
+torch
+transformers
+ultralytics
