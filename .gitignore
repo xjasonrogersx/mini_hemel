@@ -1,3 +1,5 @@
 parts/
 best.pt
 yolo11n-seg.pt
+captures/
+__pycache__/
