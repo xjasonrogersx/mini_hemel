@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from datetime import datetime
 import io
+import json
 import logging
 from pathlib import Path
 import time
 from typing import Any
+import uuid
 
 import numpy as np
 from PIL import Image
@@ -35,6 +38,9 @@ class CarSegmentationViewer(SceneViewer):
         diffusion_model: str,
         diffusion_steps: int,
         diffusion_strength: float,
+        diffusion_queue: str,
+        rabbitmq_url: str,
+        diffusion_timeout: float,
     ) -> None:
         self.segmentation_model_path = model_path
         self.segmentation_confidence = confidence
@@ -50,7 +56,9 @@ class CarSegmentationViewer(SceneViewer):
         self.diffusion_model_path = diffusion_model
         self.diffusion_steps = diffusion_steps
         self.diffusion_strength = diffusion_strength
-        self.diffusion_pipeline: Any = None
+        self.diffusion_queue = diffusion_queue
+        self.rabbitmq_url = rabbitmq_url
+        self.diffusion_timeout = diffusion_timeout
         self.visdrone_model: Any = None
         self.highlight_geometry: list[str] = []
         self.detected_car_triangles: list[np.ndarray] = []
@@ -171,67 +179,93 @@ class CarSegmentationViewer(SceneViewer):
         except Exception:
             LOGGER.exception("Failed to save current view")
 
-    def _load_diffusion_pipeline(self) -> Any:
-        if self.diffusion_pipeline is None:
-            try:
-                import torch
-                from diffusers import StableDiffusion3Img2ImgPipeline
-            except ImportError as exc:
-                raise RuntimeError(
-                    "Stable Diffusion enhancement requires diffusers. "
-                    "Install it with: pip install diffusers"
-                ) from exc
-
-            LOGGER.info("Loading Stable Diffusion 3.5 model: %s", self.diffusion_model_path)
-            self.diffusion_pipeline = StableDiffusion3Img2ImgPipeline.from_pretrained(
-                self.diffusion_model_path,
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                low_cpu_mem_usage=True,
-            )
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            if device == "cuda":
-                self.diffusion_pipeline.enable_model_cpu_offload()
-            else:
-                self.diffusion_pipeline.to(device)
-                self.diffusion_pipeline.enable_attention_slicing()
-            LOGGER.info("Stable Diffusion 3.5 loaded on %s", device)
-        return self.diffusion_pipeline
-
     def enhance_current_view(self) -> None:
         try:
-            import torch
-
             image = Image.fromarray(self._capture_view()).convert("RGB")
             self.screenshot_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             input_path = self.screenshot_dir / f"view_a_input_{timestamp}.png"
             output_path = self.screenshot_dir / f"view_a_enhanced_{timestamp}.png"
             image.save(input_path)
-            self.set_caption("Enhancing view with Stable Diffusion 3.5...")
-            pipeline = self._load_diffusion_pipeline()
-            generator = torch.Generator(device=pipeline.device).manual_seed(0)
-            enhanced = pipeline(
-                prompt=(
-                    "high quality photorealistic street-level 3D reconstruction, "
-                    "sharp details, natural lighting, preserve the exact geometry "
-                    "and composition of the input image"
-                ),
-                negative_prompt=(
-                    "changed camera angle, changed buildings, changed cars, "
-                    "warped geometry, extra objects, text, watermark, blur"
-                ),
-                image=image,
-                strength=self.diffusion_strength,
-                num_inference_steps=self.diffusion_steps,
-                guidance_scale=4.5,
-                generator=generator,
-            ).images[0]
+            self.set_caption("Sending view to Stable Diffusion worker...")
+            enhanced = self._request_diffusion(image)
             enhanced.save(output_path)
             LOGGER.info("Saved enhanced view to %s", output_path)
             self.set_caption(f"Enhanced view saved: {output_path.name}")
         except Exception as exc:
             self.set_caption(f"Stable Diffusion enhancement failed: {exc}")
             LOGGER.exception("Stable Diffusion enhancement failed")
+
+    def _request_diffusion(self, image: Image.Image) -> Image.Image:
+        try:
+            import pika
+        except ImportError as exc:
+            raise RuntimeError(
+                "RabbitMQ diffusion requests require pika. Install it with: "
+                "pip install pika"
+            ) from exc
+
+        payload_buffer = io.BytesIO()
+        image.save(payload_buffer, format="PNG")
+        request = {
+            "image_base64": base64.b64encode(payload_buffer.getvalue()).decode("ascii"),
+            "model": self.diffusion_model_path,
+            "steps": self.diffusion_steps,
+            "strength": self.diffusion_strength,
+            "seed": 0,
+            "prompt": (
+                "high quality photorealistic street-level 3D reconstruction, "
+                "sharp details, natural lighting, preserve the exact geometry "
+                "and composition of the input image"
+            ),
+            "negative_prompt": (
+                "changed camera angle, changed buildings, changed cars, "
+                "warped geometry, extra objects, text, watermark, blur"
+            ),
+            "guidance_scale": 4.5,
+        }
+        connection = pika.BlockingConnection(pika.URLParameters(self.rabbitmq_url))
+        channel = connection.channel()
+        channel.queue_declare(queue=self.diffusion_queue, durable=True)
+        reply_queue = channel.queue_declare(queue="", exclusive=True).method.queue
+        correlation_id = str(uuid.uuid4())
+        response: bytes | None = None
+
+        def on_response(_channel: Any, method: Any, properties: Any, body: bytes) -> None:
+            nonlocal response
+            if properties.correlation_id == correlation_id:
+                response = body
+
+        consumer_tag = channel.basic_consume(
+            queue=reply_queue, on_message_callback=on_response, auto_ack=True
+        )
+        channel.basic_publish(
+            exchange="",
+            routing_key=self.diffusion_queue,
+            body=json.dumps(request).encode("utf-8"),
+            properties=pika.BasicProperties(
+                content_type="application/json",
+                correlation_id=correlation_id,
+                reply_to=reply_queue,
+                delivery_mode=2,
+            ),
+        )
+        deadline = time.monotonic() + self.diffusion_timeout
+        try:
+            while response is None:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Diffusion worker did not respond within {self.diffusion_timeout:g}s"
+                    )
+                connection.process_data_events(time_limit=min(1.0, deadline - time.monotonic()))
+        finally:
+            channel.basic_cancel(consumer_tag)
+            connection.close()
+
+        result = json.loads(response.decode("utf-8"))
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error", "Diffusion worker failed"))
+        return Image.open(io.BytesIO(base64.b64decode(result["image_base64"]))).convert("RGB")
 
     def _load_segmentation_model(self) -> Any:
         if self.segmentation_model is None:
@@ -782,6 +816,22 @@ def main() -> None:
         default=0.2,
         help="Stable Diffusion image change strength from 0 to 1 (default: 0.2)",
     )
+    parser.add_argument(
+        "--rabbitmq-url",
+        default="amqp://guest:guest@localhost:5672/%2F",
+        help="RabbitMQ connection URL for diffusion requests",
+    )
+    parser.add_argument(
+        "--diffusion-queue",
+        default="stable-diffusion",
+        help="RabbitMQ queue for diffusion requests (default: stable-diffusion)",
+    )
+    parser.add_argument(
+        "--diffusion-timeout",
+        type=float,
+        default=600.0,
+        help="Seconds to wait for the diffusion worker (default: 600)",
+    )
     args = parser.parse_args()
 
     if not args.model.is_file():
@@ -800,6 +850,9 @@ def main() -> None:
         diffusion_model=args.diffusion_model,
         diffusion_steps=args.diffusion_steps,
         diffusion_strength=args.diffusion_strength,
+        diffusion_queue=args.diffusion_queue,
+        rabbitmq_url=args.rabbitmq_url,
+        diffusion_timeout=args.diffusion_timeout,
     )
 
 

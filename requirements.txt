@@ -8,3 +8,4 @@ ultralytics
 scipy
 diffusers
 accelerate
+pika
