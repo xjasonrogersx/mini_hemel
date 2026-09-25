@@ -1,8 +1,149 @@
-# Stable Diffusion Model Server
+# Model Server
 
-This service runs Stable Diffusion on the machine with the larger memory/GPU.
-The viewer sends image-generation jobs through RabbitMQ and receives the
-generated PNG in response.
+These workers run on the machine with the larger memory/GPU. The viewer sends
+jobs through RabbitMQ and receives results through RabbitMQ RPC replies.
+
+The workers use separate queues so they can run independently:
+
+| Worker | Script | Queue | Result |
+| --- | --- | --- | --- |
+| Stable Diffusion | `diffusion_worker.py` | `stable-diffusion` | Generated PNG |
+| Qwen Image 2.1 | `qwenimage_worker.py` | `qwen-image` | Generated PNG |
+| Ultralytics SAM3 | `sam3_worker.py` | `sam3` | Detection metadata and masks |
+| Ultralytics SAM2 | `sam2_worker.py` | `sam2` | Detection metadata and masks |
+
+## RabbitMQ message format
+
+Both workers receive a UTF-8 JSON request message. The AMQP message properties
+must include `reply_to` and a unique `correlation_id`; the response copies the
+correlation ID. The request is acknowledged only after processing finishes.
+
+### Stable Diffusion request
+
+```json
+{
+	"image_base64": "<PNG bytes encoded as base64>",
+	"model": "optional model identifier",
+	"prompt": "high quality photorealistic street-level 3D reconstruction",
+	"negative_prompt": "changed camera angle, warped geometry",
+	"steps": 30,
+	"strength": 0.2,
+	"guidance_scale": 4.5,
+	"seed": 0
+}
+```
+
+Successful response:
+
+```json
+{
+	"ok": true,
+	"image_base64": "<generated PNG bytes encoded as base64>"
+}
+```
+
+### Qwen Image 2.1 request
+
+Qwen requests use the same RabbitMQ RPC properties and image encoding as Stable
+Diffusion. The worker accepts a local Diffusers model directory or a model ID.
+`strength` is forwarded when supported by the selected Qwen pipeline.
+
+```json
+{
+	"image_base64": "<PNG bytes encoded as base64>",
+	"prompt": "high quality photorealistic street-level 3D reconstruction",
+	"negative_prompt": "changed camera angle, warped geometry",
+	"steps": 30,
+	"strength": 0.2,
+	"guidance_scale": 4.0,
+	"seed": 0
+}
+```
+
+Successful response:
+
+```json
+{
+	"ok": true,
+	"image_base64": "<generated PNG bytes encoded as base64>"
+}
+```
+
+### SAM3 request
+
+`image_base64` is required. The prompt fields are optional and should match
+the Ultralytics SAM3 prediction API. Use points and labels together for point
+prompting, or use bounding boxes for box prompting.
+
+```json
+{
+	"image_base64": "<PNG bytes encoded as base64>",
+	"points": [[320, 240]],
+	"labels": [1],
+	"bboxes": [[100, 80, 500, 400]],
+	"text": "car",
+	"conf": 0.25
+}
+```
+
+### SAM2 request
+
+The SAM2 request uses the same image and detection response format as SAM3.
+`image_base64` is required. `points` and `labels` are used together for point
+prompting; `bboxes` is used for box prompting. All prompt fields are optional.
+
+```json
+{
+	"image_base64": "<PNG bytes encoded as base64>",
+	"points": [[320, 240]],
+	"labels": [1],
+	"bboxes": [[100, 80, 500, 400]],
+	"conf": 0.25
+}
+```
+
+Successful responses contain `width`, `height`, and one detection entry per
+returned mask:
+
+```json
+{
+	"ok": true,
+	"width": 800,
+	"height": 600,
+	"detections": [
+		{
+			"mask_base64": "<binary PNG mask, white is inside the mask>",
+			"box_xyxy": [100.0, 80.0, 500.0, 400.0],
+			"confidence": 0.98,
+			"class_id": 0
+		}
+	]
+}
+```
+
+Successful response:
+
+```json
+{
+	"ok": true,
+	"width": 800,
+	"height": 600,
+	"detections": [
+		{
+			"mask_base64": "<binary PNG mask, white is inside the mask>",
+			"box_xyxy": [100.0, 80.0, 500.0, 400.0],
+			"confidence": 0.98,
+			"class_id": 0
+		}
+	]
+}
+```
+
+For either worker, failures use:
+
+```json
+{"ok": false, "error": "description of the failure"}
+```
 
 ## 1. Copy and extract the model
 
@@ -49,7 +190,9 @@ the worker dependencies:
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install --upgrade pip
-python3 -m pip install torch diffusers transformers accelerate pika Pillow
+python3 -m pip install torch transformers accelerate pika Pillow
+# Qwen Image 2.1 requires the current Diffusers source version.
+python3 -m pip install --upgrade git+https://github.com/huggingface/diffusers.git
 ```
 
 Install a CUDA-enabled PyTorch build if this machine has an NVIDIA GPU. Verify
@@ -102,6 +245,109 @@ Waiting for diffusion requests on queue stable-diffusion
 Keep this process running. It loads the model once and then handles requests
 one at a time.
 
+## Start the Qwen Image worker
+
+Install the same base dependencies used by the diffusion worker:
+
+```bash
+source .venv/bin/activate
+python3 -m pip install torch transformers accelerate pika Pillow
+# Qwen Image 2.1 requires the current Diffusers source version.
+python3 -m pip install --upgrade git+https://github.com/huggingface/diffusers.git
+```
+
+Start with the Qwen Image 2.1 model ID:
+
+```bash
+python3 qwenimage_worker.py \
+	--model Qwen/Qwen-Image-2.1 \
+	--rabbitmq-url amqp://guest:guest@LXP-J-ROGERS2:5672/%2F \
+	--queue qwen-image
+```
+
+For an already downloaded model, replace the model ID with its local Diffusers
+directory. The worker prints:
+
+```text
+Waiting for Qwen Image requests on queue qwen-image
+```
+
+Use a Qwen-compatible client that publishes to `qwen-image`; the response is
+the same generated-PNG format documented above.
+
+## Start the SAM3 worker
+
+Install Ultralytics in the same virtual environment. Use a CUDA-enabled
+PyTorch build on the GPU server when appropriate:
+
+```bash
+source .venv/bin/activate
+python3 -m pip install ultralytics
+```
+
+Start the worker with a local SAM3 checkpoint. The checkpoint can be named
+`sam3.pt`, or you can provide its full path:
+
+```bash
+python3 sam3_worker.py \
+	--model /opt/models/sam3.pt \
+	--rabbitmq-url amqp://guest:guest@LXP-J-ROGERS2:5672/%2F \
+	--queue sam3
+```
+
+The worker prints:
+
+```text
+Waiting for SAM3 requests on queue sam3
+```
+
+Do not run both workers on the same queue. Stable Diffusion uses
+`stable-diffusion`; SAM3 uses `sam3`; SAM2 uses `sam2`.
+
+## Start the SAM2 worker
+
+Install Ultralytics in the worker virtual environment:
+
+```bash
+source .venv/bin/activate
+python3 -m pip install ultralytics
+```
+
+Start the worker with a SAM2 checkpoint. Ultralytics can download
+`sam2_b.pt` on first use, or you can provide a local checkpoint path:
+
+```bash
+python3 sam2_worker.py \
+	--model /opt/models/sam2_b.pt \
+	--rabbitmq-url amqp://guest:guest@LXP-J-ROGERS2:5672/%2F \
+	--queue sam2
+```
+
+The worker prints:
+
+```text
+Waiting for SAM2 requests on queue sam2
+```
+
+Use the `sam2` queue for SAM2 clients and the `sam3` queue for SAM3 clients.
+
+## Test SAM2 through RabbitMQ
+
+Keep `sam2_worker.py` running, then run the RPC test from another terminal in
+this directory. It sends a center-point prompt using the input image:
+
+```bash
+source .venv/bin/activate
+python3 sam2_test.py /path/to/test-image.jpg \
+	--rabbitmq-url amqp://guest:guest@LXP-J-ROGERS2:5672/%2F \
+	--queue sam2
+```
+
+The test writes `sam2_overlay.png` and one `sam2_mask_*.png` per returned mask
+under `sam2_test_output/`. Use `--output-dir` to change that location.
+This is an end-to-end test of the RabbitMQ connection, queue, RPC properties,
+SAM2 inference, and response decoding.
+
 ## 5. Connect the viewer
 
 On the viewer machine, install `pika` in its Python environment:
@@ -132,3 +378,4 @@ and generated images are saved in the viewer's `captures/` directory.
 	or use a smaller diffusion model.
 - The viewer times out: check that the worker reached the waiting message and
 	that both sides use the same queue and RabbitMQ URL.
+add
