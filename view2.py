@@ -102,23 +102,7 @@ class CarSegmentationViewer(SceneViewer):
         if self._walk_mode:
             self._walk_mouse_look(dx, dy)
             return
-
-        self.view["ball"].drag(np.array([x, y]))
-        camera_transform = self.view["ball"].pose.copy()
-        backward = camera_transform[:3, 2]
-        forward = -backward
-        world_up = np.array([0.0, 1.0, 0.0])
-        right = np.cross(forward, world_up)
-        right_length = np.linalg.norm(right)
-
-        if right_length > 1e-8:
-            right /= right_length
-            up = np.cross(right, forward)
-            camera_transform[:3, :3] = np.column_stack((right, up, backward))
-            self.view["ball"]._pose = camera_transform
-            self.view["ball"]._n_pose = camera_transform
-
-        self.scene.camera_transform = camera_transform
+        super().on_mouse_drag(x, y, dx, dy, buttons, modifiers)
 
     def _walk_mouse_look(self, dx: int, dy: int) -> None:
         rotation = self.scene.camera_transform[:3, :3]
