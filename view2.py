@@ -64,6 +64,7 @@ class CarSegmentationViewer(SceneViewer):
         self.detected_car_triangles: list[np.ndarray] = []
         self.detected_face_records: list[tuple[str, str, np.ndarray]] = []
         self._top_down = False
+        self._walk_mode = False
         self._normal_camera_transform = scene.camera_transform.copy()
         self._last_left_click: tuple[float, float, float] | None = None
         super().__init__(
@@ -98,6 +99,10 @@ class CarSegmentationViewer(SceneViewer):
     def on_mouse_drag(
         self, x: int, y: int, dx: int, dy: int, buttons: int, modifiers: int
     ) -> None:
+        if self._walk_mode:
+            self._walk_mouse_look(dx, dy)
+            return
+
         self.view["ball"].drag(np.array([x, y]))
         camera_transform = self.view["ball"].pose.copy()
         backward = camera_transform[:3, 2]
@@ -110,45 +115,205 @@ class CarSegmentationViewer(SceneViewer):
             right /= right_length
             up = np.cross(right, forward)
             camera_transform[:3, :3] = np.column_stack((right, up, backward))
+            self.view["ball"]._pose = camera_transform
             self.view["ball"]._n_pose = camera_transform
 
         self.scene.camera_transform = camera_transform
 
-    def _move_camera_above_click(self, x: int, y: int) -> None:
-        origins, directions, pixels = self.scene.camera_rays()
-        width, height = map(int, self.scene.camera.resolution)
-        pixel = np.array([height - 1 - int(y), int(x)])
-        matches = np.flatnonzero(np.all(pixels == pixel, axis=1))
-        if not len(matches):
-            self.set_caption("Could not find the clicked camera ray")
-            return
+    def _walk_mouse_look(self, dx: int, dy: int) -> None:
+        rotation = self.scene.camera_transform[:3, :3]
+        forward = -rotation[:, 2]
+        world_up = np.array([0.0, 1.0, 0.0])
+        right = rotation[:, 0]
 
-        ray_index = int(matches[0])
-        origin = origins[ray_index]
-        direction = directions[ray_index]
-        street_y = float(self.scene.bounds[0, 1])
-        if abs(direction[1]) < 1e-8:
-            self.set_caption("Clicked ray does not intersect the street plane")
-            return
+        yaw = trimesh.transformations.rotation_matrix(
+            -float(dx) * 0.005, world_up
+        )[:3, :3]
+        pitched_forward = yaw.dot(forward)
+        pitched_right = yaw.dot(right)
+        pitch = float(dy) * 0.005
+        candidate = trimesh.transformations.rotation_matrix(
+            pitch, pitched_right
+        )[:3, :3].dot(pitched_forward)
+        if abs(candidate[1]) < 0.996:
+            forward = candidate
+        else:
+            forward = pitched_forward
 
-        distance = (street_y - origin[1]) / direction[1]
-        if distance <= 0:
-            self.set_caption("Clicked street point is behind the camera")
-            return
-
-        street_point = origin + direction * distance
+        right = np.cross(forward, world_up)
+        right /= np.linalg.norm(right)
+        up = np.cross(right, forward)
         camera_transform = self.scene.camera_transform.copy()
-        camera_transform[:3, 3] = street_point + np.array([0.0, 1.5, 0.0])
+        camera_transform[:3, :3] = np.column_stack((right, up, -forward))
         self.scene.camera_transform = camera_transform
         self.view["ball"]._pose = camera_transform
         self.view["ball"]._n_pose = camera_transform
         self._redraw()
+
+    def _highest_triangle_y(self, x: float, z: float) -> float | None:
+        highest_y: float | None = None
+        tolerance = max(float(self.scene.scale) * 1e-6, 1e-6)
+        point = np.array([x, z])
+
+        for node_name in self.scene.graph.nodes_geometry:
+            transform, geometry_name = self.scene.graph.get(node_name)
+            if geometry_name is None or geometry_name not in self.scene.geometry:
+                continue
+            geometry = self.scene.geometry[geometry_name]
+            if not isinstance(geometry, trimesh.Trimesh) or geometry.faces.size == 0:
+                continue
+
+            triangles = transform_points(geometry.vertices, transform)[geometry.faces]
+            projected = triangles[:, :, (0, 2)]
+            edge_one = projected[:, 1] - projected[:, 0]
+            edge_two = projected[:, 2] - projected[:, 0]
+            denominator = (
+                edge_one[:, 0] * edge_two[:, 1]
+                - edge_two[:, 0] * edge_one[:, 1]
+            )
+            valid = np.abs(denominator) > tolerance
+            if not valid.any():
+                continue
+
+            relative = point - projected[valid, 0]
+            edge_one_valid = edge_one[valid]
+            edge_two_valid = edge_two[valid]
+            denominator_valid = denominator[valid]
+            first = (
+                relative[:, 0] * edge_two_valid[:, 1]
+                - edge_two_valid[:, 0] * relative[:, 1]
+            ) / denominator_valid
+            second = (
+                edge_one_valid[:, 0] * relative[:, 1]
+                - relative[:, 0] * edge_one_valid[:, 1]
+            ) / denominator_valid
+            inside = (
+                (first >= -tolerance)
+                & (second >= -tolerance)
+                & (first + second <= 1.0 + tolerance)
+            )
+            if not inside.any():
+                continue
+
+            valid_triangles = triangles[valid][inside]
+            first_inside = first[inside]
+            second_inside = second[inside]
+            heights = (
+                valid_triangles[:, 0, 1]
+                + first_inside
+                * (valid_triangles[:, 1, 1] - valid_triangles[:, 0, 1])
+                + second_inside
+                * (valid_triangles[:, 2, 1] - valid_triangles[:, 0, 1])
+            )
+            triangle_y = float(np.max(heights))
+            if highest_y is None or triangle_y > highest_y:
+                highest_y = triangle_y
+
+        return highest_y
+
+    def _move_camera_above_click(self, x: int, y: int) -> None:
+        origins, directions, pixels = self.scene.camera_rays()
+        _, height = map(int, self.scene.camera.resolution)
+        pixel = np.array([height - 1 - int(y), int(x)])
+        matches = np.flatnonzero(np.all(pixels == pixel, axis=1))
+        ray_index = int(matches[0]) if len(matches) else int(
+            np.argmin(np.sum((pixels - pixel) ** 2, axis=1))
+        )
+        origin = origins[ray_index]
+        direction = directions[ray_index]
+        street_point = self._ray_triangle_hit(origin, direction)
+        if street_point is None:
+            self.set_caption("Could not find a model surface at the clicked point")
+            return
+
+        camera_transform = self.scene.camera_transform.copy()
+        forward = -camera_transform[:3, 2].copy()
+        forward[1] = 0.0
+        forward_length = np.linalg.norm(forward)
+        if forward_length <= 1e-8:
+            forward = np.array([0.0, 0.0, -1.0])
+        else:
+            forward /= forward_length
+        world_up = np.array([0.0, 1.0, 0.0])
+        right = np.cross(forward, world_up)
+        right /= np.linalg.norm(right)
+        up = np.cross(right, forward)
+        camera_transform[:3, :3] = np.column_stack((right, up, -forward))
+        camera_transform[:3, 3] = street_point + np.array([0.0, 3.0, 0.0])
+        self.scene.camera_transform = camera_transform
+        self.view["ball"]._pose = camera_transform
+        self.view["ball"]._n_pose = camera_transform
+        self.view["ball"]._target = street_point
+        self.view["ball"]._n_target = street_point
+        self._walk_mode = True
+        self._redraw()
         self.set_caption(
-            "Camera moved to %.2f, %.2f, %.2f"
+            "Walk mode: arrow up/down move, mouse looks | camera at %.2f, %.2f, %.2f"
             % tuple(camera_transform[:3, 3])
         )
 
+    def _ray_triangle_hit(
+        self, origin: np.ndarray, direction: np.ndarray
+    ) -> np.ndarray | None:
+        closest_distance = np.inf
+        closest_point: np.ndarray | None = None
+        epsilon = max(float(self.scene.scale) * 1e-8, 1e-8)
+
+        for node_name in self.scene.graph.nodes_geometry:
+            transform, geometry_name = self.scene.graph.get(node_name)
+            if geometry_name is None or geometry_name not in self.scene.geometry:
+                continue
+            geometry = self.scene.geometry[geometry_name]
+            if not isinstance(geometry, trimesh.Trimesh) or geometry.faces.size == 0:
+                continue
+
+            triangles = transform_points(geometry.vertices, transform)[geometry.faces]
+            edge_one = triangles[:, 1] - triangles[:, 0]
+            edge_two = triangles[:, 2] - triangles[:, 0]
+            cross_direction = np.cross(direction, edge_two)
+            determinant = np.einsum("ij,ij->i", edge_one, cross_direction)
+            valid = np.abs(determinant) > epsilon
+            if not valid.any():
+                continue
+
+            inverse = 1.0 / determinant[valid]
+            offset = origin - triangles[valid, 0]
+            first = inverse * np.einsum(
+                "ij,ij->i", offset, cross_direction[valid]
+            )
+            second = inverse * np.einsum(
+                "j,ij->i", direction, np.cross(offset, edge_one[valid])
+            )
+            distance = inverse * np.einsum(
+                "ij,ij->i", edge_two[valid], np.cross(offset, edge_one[valid])
+            )
+            inside = (
+                (first >= 0.0)
+                & (second >= 0.0)
+                & (first + second <= 1.0)
+                & (distance > epsilon)
+                & (distance < closest_distance)
+            )
+            if not inside.any():
+                continue
+
+            hit_distance = float(np.min(distance[inside]))
+            closest_distance = hit_distance
+            closest_point = origin + direction * hit_distance
+
+        return closest_point
+
     def on_key_press(self, symbol: int, modifiers: int) -> None:
+        if self._walk_mode:
+            if symbol in (self._key("UP"), self._key("DOWN")):
+                self._walk_forward(1.0 if symbol == self._key("UP") else -1.0)
+                return
+            if symbol in (self._key("LEFT"), self._key("RIGHT")):
+                self._walk_turn(1.0 if symbol == self._key("LEFT") else -1.0)
+                return
+            if symbol in (self._key("H"), self._key("L")):
+                self._walk_vertical(1.0 if symbol == self._key("H") else -1.0)
+                return
         if symbol == self._key("Q"):
             self.segment_cars()
             return
@@ -159,6 +324,7 @@ class CarSegmentationViewer(SceneViewer):
             self.enhance_current_view()
             return
         if symbol == self._key("G"):
+            self._walk_mode = False
             self.toggle_top_down_view()
             return
         if symbol == self._key("W"):
@@ -171,6 +337,51 @@ class CarSegmentationViewer(SceneViewer):
             self.flatten_detected_cars()
             return
         super().on_key_press(symbol, modifiers)
+
+    def _walk_forward(self, direction: float) -> None:
+        camera_transform = self.scene.camera_transform.copy()
+        current_position = camera_transform[:3, 3].copy()
+        current_ground = self._highest_triangle_y(
+            current_position[0], current_position[2]
+        )
+        forward = -camera_transform[:3, 2].copy()
+        forward_length = np.linalg.norm(forward)
+        if forward_length <= 1e-8:
+            return
+        forward /= forward_length
+        distance = max(float(self.scene.scale) * 0.01, 0.02)
+        next_position = current_position + direction * distance * forward
+        if current_ground is not None:
+            next_ground = self._highest_triangle_y(
+                next_position[0], next_position[2]
+            )
+            if next_ground is not None:
+                next_position[1] = current_position[1] - current_ground + next_ground
+        camera_transform[:3, 3] = next_position
+        self.scene.camera_transform = camera_transform
+        self.view["ball"]._pose = camera_transform
+        self.view["ball"]._n_pose = camera_transform
+        self._redraw()
+
+    def _walk_turn(self, direction: float) -> None:
+        camera_transform = self.scene.camera_transform.copy()
+        angle = direction * 0.03
+        world_up = np.array([0.0, 1.0, 0.0])
+        yaw = trimesh.transformations.rotation_matrix(angle, world_up)
+        camera_transform[:3, :3] = yaw[:3, :3].dot(camera_transform[:3, :3])
+        self.scene.camera_transform = camera_transform
+        self.view["ball"]._pose = camera_transform
+        self.view["ball"]._n_pose = camera_transform
+        self._redraw()
+
+    def _walk_vertical(self, direction: float) -> None:
+        camera_transform = self.scene.camera_transform.copy()
+        distance = max(float(self.scene.scale) * 0.01, 0.02)
+        camera_transform[1, 3] += direction * distance
+        self.scene.camera_transform = camera_transform
+        self.view["ball"]._pose = camera_transform
+        self.view["ball"]._n_pose = camera_transform
+        self._redraw()
 
     @staticmethod
     def _key(name: str) -> int:
