@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import inspect
 import json
 import logging
 from typing import Any
@@ -66,7 +67,7 @@ class QwenImageWorker:
             "prompt": prompt,
             "image": image,
             "num_inference_steps": int(request.get("steps", 30)),
-            "guidance_scale": float(request.get("guidance_scale", 4.0)),
+            "true_cfg_scale": float(request.get("guidance_scale", 4.0)),
             "generator": generator,
         }
         if request.get("negative_prompt") is not None:
@@ -74,18 +75,18 @@ class QwenImageWorker:
         if request.get("strength") is not None:
             pipeline_args["strength"] = float(request["strength"])
 
+        supported_args = set(inspect.signature(self.pipeline.__call__).parameters)
+        unsupported_args = set(pipeline_args) - supported_args
+        if unsupported_args:
+            LOGGER.warning(
+                "Qwen pipeline does not support %s; ignoring these request fields",
+                ", ".join(sorted(unsupported_args)),
+            )
+            for argument in unsupported_args:
+                pipeline_args.pop(argument)
+
         with torch.inference_mode():
-            try:
-                result = self.pipeline(**pipeline_args).images[0]
-            except TypeError as exc:
-                if "strength" not in pipeline_args:
-                    raise
-                LOGGER.warning(
-                    "Qwen pipeline does not accept strength; retrying without it: %s",
-                    exc,
-                )
-                pipeline_args.pop("strength")
-                result = self.pipeline(**pipeline_args).images[0]
+            result = self.pipeline(**pipeline_args).images[0]
 
         output = io.BytesIO()
         result.save(output, format="PNG")

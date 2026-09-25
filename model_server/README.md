@@ -46,7 +46,9 @@ Successful response:
 
 Qwen requests use the same RabbitMQ RPC properties and image encoding as Stable
 Diffusion. The worker accepts a local Diffusers model directory or a model ID.
-`strength` is forwarded when supported by the selected Qwen pipeline.
+The worker maps `guidance_scale` to Qwen's `true_cfg_scale` argument. Qwen
+Image 2.1 is text-to-image; its pipeline does not use the input image,
+`strength`, or image-to-image editing arguments.
 
 ```json
 {
@@ -274,6 +276,25 @@ Waiting for Qwen Image requests on queue qwen-image
 
 Use a Qwen-compatible client that publishes to `qwen-image`; the response is
 the same generated-PNG format documented above.
+
+## Test Qwen Image through RabbitMQ
+
+Keep `qwenimage_worker.py` running, then send a test image through RabbitMQ:
+
+```bash
+source .venv/bin/activate
+python3 qwenimage_test.py /path/to/test-image.jpg \
+	--rabbitmq-url amqp://guest:guest@LXP-J-ROGERS2:5672/%2F \
+	--queue qwen-image \
+	--prompt "photorealistic street scene with sharp natural details" \
+	--output qwenimage_test_output.png \
+	--display
+```
+
+The test sends the image and generation settings as JSON, waits for the RPC
+response, and optionally writes the returned PNG to `--output`. Use
+`--display` to open the result in the system image viewer. Both options are
+optional; omit both when only checking that the RabbitMQ request succeeds.
 
 ## Start the SAM3 worker
 
