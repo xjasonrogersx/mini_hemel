@@ -8,6 +8,7 @@ The workers use separate queues so they can run independently:
 | Worker | Script | Queue | Result |
 | --- | --- | --- | --- |
 | Stable Diffusion | `diffusion_worker.py` | `stable-diffusion` | Generated PNG |
+| Stable Diffusion 1.5 | `d1.5_worker.py` | `stable-diffusion-15` | Generated PNG |
 | Qwen Image 2.1 | `qwenimage_worker.py` | `qwen-image` | Generated PNG |
 | Ultralytics SAM3 | `sam3_worker.py` | `sam3` | Detection metadata and masks |
 | Ultralytics SAM2 | `sam2_worker.py` | `sam2` | Detection metadata and masks |
@@ -41,6 +42,26 @@ Successful response:
 	"image_base64": "<generated PNG bytes encoded as base64>"
 }
 ```
+
+### Stable Diffusion 1.5 request
+
+The SD 1.5 worker uses the same image-to-image JSON format, but listens on the
+separate `stable-diffusion-15` queue. It uses `float16` on CUDA, which is more
+suitable for GPUs such as the RTX 2060 or RTX 3060 with limited VRAM.
+
+```json
+{
+	"image_base64": "<PNG bytes encoded as base64>",
+	"prompt": "high quality photorealistic street-level 3D reconstruction",
+	"negative_prompt": "changed camera angle, warped geometry",
+	"steps": 30,
+	"strength": 0.2,
+	"guidance_scale": 7.5,
+	"seed": 0
+}
+```
+
+The successful response is the same generated-PNG format shown above.
 
 ### Qwen Image 2.1 request
 
@@ -246,6 +267,52 @@ Waiting for diffusion requests on queue stable-diffusion
 
 Keep this process running. It loads the model once and then handles requests
 one at a time.
+
+## Start the Stable Diffusion 1.5 worker
+
+Install the same Diffusers dependencies, then start the smaller img2img worker:
+
+```bash
+source .venv/bin/activate
+python3 -m pip install torch diffusers transformers accelerate pika Pillow
+python3 d1.5_worker.py \
+	--rabbitmq-url amqp://guest:guest@LXP-J-ROGERS2:5672/%2F \
+	--queue stable-diffusion-15
+```
+
+The default model is `runwayml/stable-diffusion-v1-5`. To use a downloaded
+local Diffusers directory, pass it with `--model`:
+
+```bash
+python3 d1.5_worker.py \
+	--model /opt/models/stable-diffusion-v1-5 \
+	--rabbitmq-url amqp://guest:guest@LXP-J-ROGERS2:5672/%2F \
+	--queue stable-diffusion-15
+```
+
+The worker prints:
+
+```text
+Waiting for Stable Diffusion 1.5 requests on queue stable-diffusion-15
+```
+
+## Test Stable Diffusion 1.5 through RabbitMQ
+
+With `d1.5_worker.py` running, send an input image through the same broker:
+
+```bash
+source .venv/bin/activate
+python3 sd1.5_test.py /path/to/test-image.jpg \
+	--rabbitmq-url amqp://guest:guest@LXP-J-ROGERS2:5672/%2F \
+	--queue stable-diffusion-15 \
+	--prompt "photorealistic street scene with sharp natural details" \
+	--output sd15_test_output.png \
+	--display
+```
+
+`--output` and `--display` are optional. The test waits for the RPC response,
+writes the generated PNG when requested, and can open it in the system image
+viewer.
 
 ## Start the Qwen Image worker
 
