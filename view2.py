@@ -95,6 +95,25 @@ class CarSegmentationViewer(SceneViewer):
         if is_double_click:
             self._move_camera_above_click(x, y)
 
+    def on_mouse_drag(
+        self, x: int, y: int, dx: int, dy: int, buttons: int, modifiers: int
+    ) -> None:
+        self.view["ball"].drag(np.array([x, y]))
+        camera_transform = self.view["ball"].pose.copy()
+        backward = camera_transform[:3, 2]
+        forward = -backward
+        world_up = np.array([0.0, 1.0, 0.0])
+        right = np.cross(forward, world_up)
+        right_length = np.linalg.norm(right)
+
+        if right_length > 1e-8:
+            right /= right_length
+            up = np.cross(right, forward)
+            camera_transform[:3, :3] = np.column_stack((right, up, backward))
+            self.view["ball"]._n_pose = camera_transform
+
+        self.scene.camera_transform = camera_transform
+
     def _move_camera_above_click(self, x: int, y: int) -> None:
         origins, directions, pixels = self.scene.camera_rays()
         width, height = map(int, self.scene.camera.resolution)
