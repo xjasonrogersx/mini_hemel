@@ -61,6 +61,7 @@ class CarSegmentationViewer(SceneViewer):
         self.diffusion_timeout = diffusion_timeout
         self.visdrone_model: Any = None
         self.highlight_geometry: list[str] = []
+        self.red_highlight_geometry: list[str] = []
         self.detected_car_triangles: list[np.ndarray] = []
         self.detected_face_records: list[tuple[str, str, np.ndarray]] = []
         self._top_down = False
@@ -192,6 +193,62 @@ class CarSegmentationViewer(SceneViewer):
             triangle_y = float(np.max(heights))
             if highest_y is None or triangle_y > highest_y:
                 highest_y = triangle_y
+
+        return highest_y
+
+    def _road_height_below(
+        self, x: float, z: float, maximum_y: float, excluded_node: str
+    ) -> float | None:
+        highest_y: float | None = None
+        tolerance = max(float(self.scene.scale) * 1e-6, 1e-6)
+        point = np.array([x, z])
+
+        for node_name in self.scene.graph.nodes_geometry:
+            if node_name == excluded_node:
+                continue
+            transform, geometry_name = self.scene.graph.get(node_name)
+            if geometry_name is None or geometry_name not in self.scene.geometry:
+                continue
+            geometry = self.scene.geometry[geometry_name]
+            if not isinstance(geometry, trimesh.Trimesh) or geometry.faces.size == 0:
+                continue
+
+            triangles = transform_points(geometry.vertices, transform)[geometry.faces]
+            below = np.max(triangles[:, :, 1], axis=1) <= maximum_y + tolerance
+            if not below.any():
+                continue
+            triangles = triangles[below]
+            projected = triangles[:, :, (0, 2)]
+            edge_one = projected[:, 1] - projected[:, 0]
+            edge_two = projected[:, 2] - projected[:, 0]
+            denominator = (
+                edge_one[:, 0] * edge_two[:, 1]
+                - edge_two[:, 0] * edge_one[:, 1]
+            )
+            valid = np.abs(denominator) > tolerance
+            if not valid.any():
+                continue
+            relative = point - projected[valid, 0]
+            edge_one = edge_one[valid]
+            edge_two = edge_two[valid]
+            denominator = denominator[valid]
+            first = (
+                relative[:, 0] * edge_two[:, 1]
+                - edge_two[:, 0] * relative[:, 1]
+            ) / denominator
+            second = (
+                edge_one[:, 0] * relative[:, 1]
+                - relative[:, 0] * edge_one[:, 1]
+            ) / denominator
+            inside = (
+                (first >= -tolerance)
+                & (second >= -tolerance)
+                & (first + second <= 1.0 + tolerance)
+            )
+            if inside.any():
+                triangle_y = float(np.max(triangles[valid][inside, :, 1]))
+                if highest_y is None or triangle_y > highest_y:
+                    highest_y = triangle_y
 
         return highest_y
 
@@ -516,10 +573,22 @@ class CarSegmentationViewer(SceneViewer):
         return self.segmentation_model
 
     def _remove_highlights(self) -> None:
-        for geometry_name in self.highlight_geometry:
+        overlay_prefixes = (
+            "__car_highlight_",
+            "__flattened_car_overlay_",
+            "__flattened_car_geometry_",
+            "__car_remainder_",
+        )
+        overlay_names = set(self.red_highlight_geometry)
+        overlay_names.update(
+            name
+            for name in self.scene.geometry
+            if name.startswith(overlay_prefixes)
+        )
+        for geometry_name in overlay_names:
             if geometry_name in self.scene.geometry:
                 self.scene.delete_geometry(geometry_name)
-        self.highlight_geometry.clear()
+        self.red_highlight_geometry.clear()
         self.cleanup_geometries()
 
     def _load_segformer_model(self) -> Any:
@@ -738,91 +807,66 @@ class CarSegmentationViewer(SceneViewer):
                 np.array([255, 40, 40, 230], dtype=np.uint8),
                 (len(selected_triangles), 1),
             )
-            overlay_name = f"__car_highlight_{len(self.highlight_geometry)}"
+            overlay_name = f"__car_highlight_{len(self.red_highlight_geometry)}"
             self.scene.add_geometry(overlay, geom_name=overlay_name)
-            self.highlight_geometry.append(overlay_name)
+            self.red_highlight_geometry.append(overlay_name)
 
     def flatten_detected_cars(self) -> None:
         if not self.detected_face_records:
+            self._remove_highlights()
             LOGGER.warning("R pressed, but no detected car triangles are available")
-            self.set_caption("No detected car triangles to flatten")
+            self.set_caption("No detected car triangles to remove")
             return
 
+        LOGGER.info(
+            "Removing car triangles from %d detected face records",
+            len(self.detected_face_records),
+        )
+        records = list(self.detected_face_records)
         self._remove_highlights()
-        selected_world_triangles: list[np.ndarray] = []
-        for node_name, geometry_name, selected in self.detected_face_records:
-            if geometry_name not in self.scene.geometry:
+        selected_by_node: dict[str, np.ndarray] = {}
+        for node_name, geometry_name, selected in records:
+            if node_name not in self.scene.graph.nodes_geometry:
                 continue
-            transform, current_geometry_name = self.scene.graph.get(node_name)
-            geometry = self.scene.geometry[current_geometry_name]
-            if isinstance(geometry, trimesh.Trimesh):
-                world_vertices = transform_points(geometry.vertices, transform)
-                selected_world_triangles.append(
-                    world_vertices[geometry.faces[selected]].copy()
-                )
-        if not selected_world_triangles:
-            LOGGER.warning("Detected car records contain no valid mesh faces")
-            self.set_caption("No valid car triangles to flatten")
-            return
-
-        flattened_count = 0
-        for record_index, (
-            node_name,
-            geometry_name,
-            selected,
-        ) in enumerate(self.detected_face_records):
-            if geometry_name not in self.scene.geometry:
-                continue
-            transform, current_geometry_name = self.scene.graph.get(node_name)
-            geometry = self.scene.geometry[current_geometry_name]
+            _, current_geometry_name = self.scene.graph.get(node_name)
+            geometry = self.scene.geometry.get(current_geometry_name)
             if not isinstance(geometry, trimesh.Trimesh):
                 continue
+            if len(selected) != len(geometry.faces):
+                LOGGER.warning("Skipping stale car face record for %s", node_name)
+                continue
+            if node_name not in selected_by_node:
+                selected_by_node[node_name] = np.zeros(
+                    len(geometry.faces), dtype=bool
+                )
+            selected_by_node[node_name] |= selected
 
-            unselected_indices = np.flatnonzero(~selected)
-            if len(unselected_indices):
-                remainder = geometry.submesh(
-                    [unselected_indices], append=True, repair=False
-                )
-                remainder_name = f"__car_remainder_{record_index}"
-                remainder_node = f"__car_remainder_node_{record_index}"
-                self.scene.add_geometry(
-                    remainder,
-                    node_name=remainder_node,
-                    geom_name=remainder_name,
-                    transform=transform,
-                )
-                self.highlight_geometry.append(remainder_name)
-            world_vertices = transform_points(geometry.vertices, transform)
-            selected_triangles = world_vertices[geometry.faces[selected]].copy()
-            inside_indices = np.argmax(selected_triangles[:, :, 1], axis=1)
-            triangle_indices = np.arange(len(selected_triangles))
-            outside_mask = np.ones(selected_triangles.shape[:2], dtype=bool)
-            outside_mask[triangle_indices, inside_indices] = False
-            outside_y = selected_triangles[:, :, 1][outside_mask].reshape(-1, 2)
-            selected_triangles[triangle_indices, inside_indices, 1] = outside_y.mean(axis=1)
-            flattened = trimesh.Trimesh(
-                vertices=selected_triangles.reshape(-1, 3),
-                faces=np.arange(len(selected_triangles) * 3).reshape(-1, 3),
-                process=False,
+        selected_faces_count = 0
+        for node_name, selected in selected_by_node.items():
+            transform, geometry_name = self.scene.graph.get(node_name)
+            geometry = self.scene.geometry[geometry_name]
+            if not selected.any():
+                continue
+
+            LOGGER.info(
+                "Removing %d car faces from node %s (%d total faces)",
+                int(selected.sum()),
+                node_name,
+                len(geometry.faces),
             )
-            flattened.visual.face_colors = np.tile(
-                np.array([128, 128, 128, 255], dtype=np.uint8),
-                (len(selected_triangles), 1),
-            )
-            flattened_name = f"__flattened_car_geometry_{record_index}"
-            self.scene.add_geometry(flattened, geom_name=flattened_name)
-            self.highlight_geometry.append(flattened_name)
-            self.hide_geometry(node_name)
-            flattened_count += len(selected_triangles)
+            geometry.update_faces(~selected)
+            geometry.remove_unreferenced_vertices()
+            selected_faces_count += int(selected.sum())
 
         self._update_vertex_list()
         self._redraw()
+        self.detected_face_records.clear()
+        self.detected_car_triangles.clear()
         LOGGER.info(
-            "Replaced %d detected car triangles with grey geometry flattened "
-            "to the average Y of each triangle's outside vertices",
-            flattened_count,
+            "Removed %d detected car triangles and left holes in the meshes",
+            selected_faces_count,
         )
-        self.set_caption(f"Flattened grey cars: {flattened_count} triangles")
+        self.set_caption(f"Removed {selected_faces_count} car triangles")
 
     def segment_cars(self) -> None:
         try:
