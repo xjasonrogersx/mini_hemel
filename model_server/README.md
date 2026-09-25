@@ -280,6 +280,15 @@ python3 d1.5_worker.py \
 	--queue stable-diffusion-15
 ```
 
+Add `--cpu` to force CPU inference, for example when GPU memory is exhausted:
+
+```bash
+python3 d1.5_worker.py \
+	--cpu \
+	--rabbitmq-url amqp://guest:guest@LXP-J-ROGERS2:5672/%2F \
+	--queue stable-diffusion-15
+```
+
 The default model is `runwayml/stable-diffusion-v1-5`. To use a downloaded
 local Diffusers directory, pass it with `--model`:
 

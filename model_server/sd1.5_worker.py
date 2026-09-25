@@ -22,13 +22,14 @@ LOGGER = logging.getLogger(__name__)
 class SD15Worker:
     def __init__(self, args: argparse.Namespace) -> None:
         LOGGER.info("Loading Stable Diffusion 1.5 model: %s", args.model)
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        use_cuda = torch.cuda.is_available() and not args.cpu
+        dtype = torch.float16 if use_cuda else torch.float32
         self.pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
             args.model,
             torch_dtype=dtype,
             safety_checker=None,
         )
-        if torch.cuda.is_available():
+        if use_cuda:
             self.pipeline.enable_model_cpu_offload()
         else:
             self.pipeline.to("cpu")
@@ -37,7 +38,7 @@ class SD15Worker:
         self.rabbitmq_url = args.rabbitmq_url
         LOGGER.info(
             "Stable Diffusion 1.5 loaded on %s using %s",
-            "cuda" if torch.cuda.is_available() else "cpu",
+            "cuda" if use_cuda else "cpu",
             dtype,
         )
 
@@ -122,6 +123,11 @@ def main() -> None:
         "--rabbitmq-url",
         default="amqp://guest:guest@localhost:5672/%2F",
         help="RabbitMQ connection URL",
+    )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Force CPU inference even when CUDA is available",
     )
     args = parser.parse_args()
     SD15Worker(args).run()
