@@ -439,7 +439,7 @@ class CarSegmentationViewer(SceneViewer):
         with Image.open(output) as image:
             return np.asarray(image.convert("RGB"))
 
-    def _capture_depth_image(self, height: int, width: int) -> Image.Image:
+    def _build_pyrender_scene(self, width: int, height: int) -> Any:
         import pyrender
 
         render_scene = pyrender.Scene(
@@ -464,16 +464,25 @@ class CarSegmentationViewer(SceneViewer):
             zfar=float(camera.z_far),
         )
         render_scene.add(render_camera, pose=self.scene.camera_transform)
+        return render_scene
+
+    def _capture_pyrender_images(
+        self, height: int, width: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        import pyrender
+
+        render_scene = self._build_pyrender_scene(width, height)
         renderer = pyrender.OffscreenRenderer(width, height)
         try:
-            depth = renderer.render(
-                render_scene, flags=pyrender.RenderFlags.DEPTH_ONLY
-            )
+            color, depth = renderer.render(render_scene)
         finally:
             renderer.delete()
+        return color, depth
 
+    @staticmethod
+    def _depth_to_image(depth: np.ndarray) -> Image.Image:
         valid = np.isfinite(depth) & (depth > 0.0)
-        depth_image = np.zeros((height, width), dtype=np.uint16)
+        depth_image = np.zeros(depth.shape, dtype=np.uint16)
         if valid.any():
             nearest = depth[valid].min()
             farthest = depth[valid].max()
@@ -488,30 +497,33 @@ class CarSegmentationViewer(SceneViewer):
                 depth_image[valid] = np.iinfo(np.uint16).max
         return Image.fromarray(depth_image, mode="I;16")
 
-    def _save_depth_map(self, depth_path: Path, height: int, width: int) -> None:
+    def _save_export_images(
+        self, output_path: Path, depth_path: Path, height: int, width: int
+    ) -> None:
         try:
-            self._capture_depth_image(height, width).save(depth_path)
+            color, depth = self._capture_pyrender_images(height, width)
+            Image.fromarray(color[:, :, :3], mode="RGB").save(output_path)
+            self._depth_to_image(depth).save(depth_path)
             LOGGER.info("Saved depth map to %s", depth_path)
         except Exception:
-            LOGGER.exception("Failed to save depth map")
+            LOGGER.exception("Failed to save RGB and depth exports")
 
     def save_current_view(self) -> None:
         try:
-            image = self._capture_view()
+            _, height = map(int, self.scene.camera.resolution)
+            width = int(self.scene.camera.resolution[0])
             self.screenshot_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             output_path = self.screenshot_dir / f"view_{timestamp}.png"
             depth_path = self.screenshot_dir / f"depth_{timestamp}.png"
-            Image.fromarray(image).save(output_path)
-            LOGGER.info("Saved current view to %s", output_path)
             threading.Thread(
-                target=self._save_depth_map,
-                args=(depth_path, image.shape[0], image.shape[1]),
+                target=self._save_export_images,
+                args=(output_path, depth_path, height, width),
                 daemon=True,
-                name="depth-map-save",
+                name="rgb-depth-export",
             ).start()
             self.set_caption(
-                f"Trimesh SceneViewer (saved: {output_path.name}; depth pending)"
+                f"Trimesh SceneViewer (RGB/depth export pending: {timestamp})"
             )
         except Exception:
             LOGGER.exception("Failed to save current view")
