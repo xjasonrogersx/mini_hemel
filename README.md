@@ -52,3 +52,22 @@ The viewer currently uses **Google Earth-style orbit controls**.
 
 Double-click the scene to enter walk mode. Press `G` to return to orbit mode
 and `F` to toggle fullscreen.
+
+## Walk mode navigation
+
+Walk mode uses basic Quake-style movement controls:
+
+| Action | Control |
+| --- | --- |
+| Move forward | Up arrow |
+| Move backward | Down arrow |
+| Strafe left | Left arrow |
+| Strafe right | Right arrow |
+| Turn left/right in windowed mode | `Z` / `X` |
+| Look around in fullscreen mode | Move the mouse freely |
+| Look around in windowed mode | Hold the left mouse button and drag |
+| Raise/lower camera height | `H` / `L` |
+| Return to orbit mode | `G` |
+| Toggle fullscreen | `F` |
+
+The window title shows the current walk height in metres.

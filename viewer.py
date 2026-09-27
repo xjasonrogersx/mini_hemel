@@ -68,6 +68,8 @@ class ModelWindow(pyglet.window.Window):
 		self.orbit_button = None
 		self.walk_mode = False
 		self.walk_keys: set[int] = set()
+		self.walk_look_drag = False
+		self.walk_height = 0.0
 		self.last_click: tuple[float, int, int] | None = None
 		self.color_buffer = np.zeros((WINDOW_HEIGHT, WINDOW_WIDTH, 4), dtype=np.uint8)
 		self.update_camera()
@@ -134,6 +136,7 @@ class ModelWindow(pyglet.window.Window):
 		if symbol == pyglet.window.key.G and self.walk_mode:
 			self.walk_mode = False
 			self.walk_keys.clear()
+			self.walk_look_drag = False
 			self.set_exclusive_mouse(False)
 			self.update_camera()
 			self.set_caption("merged.gltf | orbit | %s" % self.mode)
@@ -150,6 +153,9 @@ class ModelWindow(pyglet.window.Window):
 
 	def on_mouse_press(self, x: int, y: int, button: int, modifiers: int) -> None:
 		if button == pyglet.window.mouse.LEFT:
+			if self.walk_mode:
+				self.walk_look_drag = not self.fullscreen
+				return
 			now = time.monotonic()
 			previous = self.last_click
 			self.last_click = (now, x, y)
@@ -163,11 +169,17 @@ class ModelWindow(pyglet.window.Window):
 				return
 			self.orbit_button = "orbit" if modifiers & pyglet.window.key.MOD_SHIFT else "pan"
 		elif button == pyglet.window.mouse.MIDDLE:
+			if self.walk_mode:
+				return
 			self.orbit_button = "orbit"
 		elif button == pyglet.window.mouse.RIGHT:
 			self.orbit_button = "zoom"
 
 	def on_mouse_release(self, _x: int, _y: int, button: int, _modifiers: int) -> None:
+		if button == pyglet.window.mouse.MIDDLE and self.walk_mode:
+			return
+		if button == pyglet.window.mouse.LEFT:
+			self.walk_look_drag = False
 		if button in (
 			pyglet.window.mouse.LEFT,
 			pyglet.window.mouse.MIDDLE,
@@ -176,7 +188,7 @@ class ModelWindow(pyglet.window.Window):
 			self.orbit_button = None
 
 	def on_mouse_drag(self, x: int, y: int, dx: int, dy: int, _buttons: int, _modifiers: int) -> None:
-		if self.walk_mode and self.fullscreen:
+		if self.walk_mode and (self.fullscreen or self.walk_look_drag):
 			self.turn_camera(-dx * 0.004, dy * 0.004)
 		elif self.orbit_button == "orbit" and not self.walk_mode:
 			self.yaw -= dx * 0.01
@@ -203,12 +215,19 @@ class ModelWindow(pyglet.window.Window):
 		if np.linalg.norm(forward) < 1e-6:
 			forward = np.array([0.0, 0.0, -1.0], dtype=np.float32)
 		forward /= np.linalg.norm(forward)
-		eye_height = max(self.render_scene._orbit_extent * 0.05, 0.1)
+		eye_height = 1.5
 		camera_position = camera_position + np.array([0.0, eye_height, 0.0], dtype=np.float32)
 		self.set_walk_pose(camera_position, forward)
 		self.walk_mode = True
+		self.walk_height = float(eye_height)
 		self.set_exclusive_mouse(self.fullscreen)
-		self.set_caption("merged.gltf | walk | F fullscreen | G orbit")
+		self.update_walk_caption()
+
+	def update_walk_caption(self) -> None:
+		self.set_caption(
+			"merged.gltf | walk | height %.2f m | F fullscreen | G orbit"
+			% self.walk_height
+		)
 
 	def scene_hit(self, x: int, y: int) -> tuple[np.ndarray, np.ndarray] | None:
 		width, height = self.width, self.height
@@ -244,6 +263,50 @@ class ModelWindow(pyglet.window.Window):
 		if closest_point is None:
 			return None
 		return closest_point.astype(np.float32), (-pose[:3, 2]).astype(np.float32)
+
+	def lowest_triangle_y(self, x: float, z: float) -> float | None:
+		lowest_y = None
+		point = np.array([x, z], dtype=np.float32)
+		for mesh in self.render_scene._walk_meshes:
+			triangles = np.asarray(mesh.vertices)[np.asarray(mesh.faces)]
+			projected = triangles[:, :, (0, 2)]
+			edge_one = projected[:, 1] - projected[:, 0]
+			edge_two = projected[:, 2] - projected[:, 0]
+			denominator = edge_one[:, 0] * edge_two[:, 1] - edge_two[:, 0] * edge_one[:, 1]
+			valid = np.abs(denominator) > 1e-8
+			if not valid.any():
+				continue
+			relative = point - projected[valid, 0]
+			edge_one_valid = edge_one[valid]
+			edge_two_valid = edge_two[valid]
+			denominator_valid = denominator[valid]
+			first = (
+				relative[:, 0] * edge_two_valid[:, 1]
+				- edge_two_valid[:, 0] * relative[:, 1]
+			) / denominator_valid
+			second = (
+				edge_one_valid[:, 0] * relative[:, 1]
+				- relative[:, 0] * edge_one_valid[:, 1]
+			) / denominator_valid
+			inside = (
+				(first >= -1e-6)
+				& (second >= -1e-6)
+				& (first + second <= 1.0 + 1e-6)
+			)
+			if not inside.any():
+				continue
+			valid_triangles = triangles[valid][inside]
+			first_inside = first[inside]
+			second_inside = second[inside]
+			heights = (
+				valid_triangles[:, 0, 1]
+				+ first_inside * (valid_triangles[:, 1, 1] - valid_triangles[:, 0, 1])
+				+ second_inside * (valid_triangles[:, 2, 1] - valid_triangles[:, 0, 1])
+			)
+			candidate = float(np.min(heights))
+			if lowest_y is None or candidate < lowest_y:
+				lowest_y = candidate
+		return lowest_y
 
 	def set_walk_pose(self, position: np.ndarray, forward: np.ndarray) -> None:
 		world_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -287,20 +350,54 @@ class ModelWindow(pyglet.window.Window):
 			movement += forward
 		if pyglet.window.key.DOWN in self.walk_keys:
 			movement -= forward
-		if pyglet.window.key.LEFT in self.walk_keys:
-			movement -= right
-		if pyglet.window.key.RIGHT in self.walk_keys:
-			movement += right
+		if self.fullscreen:
+			if pyglet.window.key.LEFT in self.walk_keys:
+				movement -= right
+			if pyglet.window.key.RIGHT in self.walk_keys:
+				movement += right
 		if np.linalg.norm(movement) > 0:
 			movement /= np.linalg.norm(movement)
-			pose[:3, 3] += movement * float(self.render_scene._orbit_extent) * 0.12 * delta_time
-			self.render_scene.set_pose(self.render_scene._orbit_camera_node, pose)
+			current_ground_y = self.lowest_triangle_y(pose[0, 3], pose[2, 3])
+			next_position = pose[:3, 3] + movement * float(self.render_scene._orbit_extent) * 0.12 * delta_time
+			next_ground_y = self.lowest_triangle_y(next_position[0], next_position[2])
+			step_up = (
+				next_ground_y - current_ground_y
+				if current_ground_y is not None and next_ground_y is not None
+				else 0.0
+			)
+			if step_up <= 2.0:
+				pose[:3, 3] = next_position
+				if next_ground_y is not None:
+					pose[1, 3] = next_ground_y + self.walk_height
+				self.render_scene.set_pose(self.render_scene._orbit_camera_node, pose)
 		if pyglet.window.key.Z in self.walk_keys:
 			self.turn_camera(-1.8 * delta_time, 0.0)
 		if pyglet.window.key.X in self.walk_keys:
 			self.turn_camera(1.8 * delta_time, 0.0)
+		if not self.fullscreen:
+			if pyglet.window.key.LEFT in self.walk_keys:
+				self.turn_camera(1.8 * delta_time, 0.0)
+			if pyglet.window.key.RIGHT in self.walk_keys:
+				self.turn_camera(-1.8 * delta_time, 0.0)
+		height_change = 0.0
+		if pyglet.window.key.H in self.walk_keys:
+			height_change += 1.0
+		if pyglet.window.key.L in self.walk_keys:
+			height_change -= 1.0
+		if height_change:
+			step = max(float(self.render_scene._orbit_extent) * 0.12, 0.05)
+			old_height = self.walk_height
+			self.walk_height = max(0.1, old_height + height_change * step * delta_time)
+			delta_height = self.walk_height - old_height
+			if delta_height:
+				pose = self.render_scene.get_pose(self.render_scene._orbit_camera_node)
+				pose[1, 3] += delta_height
+				self.render_scene.set_pose(self.render_scene._orbit_camera_node, pose)
+				self.update_walk_caption()
 
 	def on_mouse_scroll(self, _x: int, _y: int, _scroll_x: int, scroll_y: int) -> None:
+		if self.walk_mode:
+			return
 		self.distance *= 0.88 ** scroll_y
 		extent = self.render_scene._orbit_extent
 		self.distance = float(np.clip(self.distance, extent * 0.25, extent * 20.0))
