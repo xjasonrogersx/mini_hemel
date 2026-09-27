@@ -246,6 +246,37 @@ The default `guest` account is normally restricted to local connections. For a
 worker and viewer on different machines, create a RabbitMQ user and use its
 host address in both commands instead.
 
+### ControlNet worker
+
+The viewer's `Q` key uses the `stable-diffusion-controlnet` queue. Install the
+additional worker packages in the model-server environment:
+
+```bash
+source .venv/bin/activate
+python3 -m pip install diffusers accelerate torchvision
+```
+
+When the viewer or worker is running inside a Docker container and RabbitMQ
+was published by Docker on the host, `localhost` points to the container, not
+the host. Use the Docker host gateway address. In this development container,
+the gateway is `172.17.0.1`:
+
+```bash
+python3 controlnet_worker.py \
+	--rabbitmq-url amqp://guest:guest@172.17.0.1:5672/%2F \
+	--queue stable-diffusion-controlnet
+```
+
+Start the viewer with the same broker URL:
+
+```bash
+RABBITMQ_URL=amqp://guest:guest@172.17.0.1:5672/%2F python3 ../viewer.py
+```
+
+Alternatively, run the worker and viewer on the same host as RabbitMQ and use
+the default `localhost` URL. Press `Q` after the worker reports that it is
+waiting for requests. The generated image is saved in `captures/`.
+
 ## 4. Start the worker
 
 Use the snapshot path discovered above:

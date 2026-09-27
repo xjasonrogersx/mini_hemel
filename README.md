@@ -71,3 +71,22 @@ Walk mode uses basic Quake-style movement controls:
 | Toggle fullscreen | `F` |
 
 The window title shows the current walk height in metres.
+
+## ControlNet textured renders
+
+Press `Q` in the viewer to save the current RGB/depth pair and generate a
+photorealistic textured render with Stable Diffusion and the depth ControlNet.
+Start RabbitMQ and the worker before launching the viewer:
+
+```bash
+python3 model_server/controlnet_worker.py \
+  --model runwayml/stable-diffusion-v1-5 \
+  --controlnet lllyasviel/sd-controlnet-depth
+python3 viewer.py
+```
+
+The generated image is saved in `captures/` as `view_controlnet_<timestamp>.png`.
+
+
+
+

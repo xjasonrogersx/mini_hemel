@@ -1,19 +1,34 @@
 """Display merged.gltf with orbit and Quake-style walk controls."""
 
 from pathlib import Path
+from datetime import datetime
+import base64
+import io
+import json
 import math
+import os
+import threading
 import time
+import uuid
 
 import numpy as np
 import pyglet
 from pyglet import gl
 import pyrender
 import trimesh
+from PIL import Image
 
 
 ASSET_PATH = Path(__file__).with_name("merged.gltf")
 WINDOW_WIDTH = 1100
 WINDOW_HEIGHT = 700
+CAPTURES_PATH = Path(__file__).with_name("captures")
+CAMERA_NEAR_RATIO = 0.005
+CAMERA_FAR_RATIO = 20.0
+CONTROLNET_QUEUE = "stable-diffusion-controlnet"
+RABBITMQ_URL = os.getenv(
+	"RABBITMQ_URL", "amqp://guest:guest@localhost:5672/%2F"
+)
 
 
 def load_scene(asset_path: Path) -> tuple[pyrender.Scene, pyrender.PerspectiveCamera]:
@@ -37,8 +52,8 @@ def load_scene(asset_path: Path) -> tuple[pyrender.Scene, pyrender.PerspectiveCa
 	camera = pyrender.PerspectiveCamera(
 		yfov=math.radians(45.0),
 		aspectRatio=WINDOW_WIDTH / WINDOW_HEIGHT,
-		znear=max(extent * 0.001, 0.001),
-		zfar=extent * 100.0,
+		znear=max(extent * CAMERA_NEAR_RATIO, 0.001),
+		zfar=extent * CAMERA_FAR_RATIO,
 	)
 	camera_node = render_scene.add(camera, name="orbit_camera")
 
@@ -101,7 +116,7 @@ class ModelWindow(pyglet.window.Window):
 		flags = pyrender.RenderFlags.RGBA
 		if self.mode == "depth":
 			depth = self.renderer.render(self.render_scene, flags=pyrender.RenderFlags.DEPTH_ONLY)
-			far = self.render_scene._orbit_extent * 4.0
+			far = self.camera.zfar
 			normalized = np.clip(1.0 - depth / far, 0.0, 1.0)
 			grayscale = (normalized * 255).astype(np.uint8)
 			self.color_buffer[:, :, :3] = grayscale[:, :, None]
@@ -129,6 +144,12 @@ class ModelWindow(pyglet.window.Window):
 		self.color_buffer = np.zeros((height, width, 4), dtype=np.uint8)
 
 	def on_key_press(self, symbol: int, _modifiers: int) -> None:
+		if symbol == pyglet.window.key.S:
+			self.save_current_view()
+			return
+		if symbol == pyglet.window.key.Q:
+			self.generate_controlnet_view()
+			return
 		if symbol == pyglet.window.key.F:
 			self.set_fullscreen(not self.fullscreen)
 			self.set_exclusive_mouse(self.fullscreen and self.walk_mode)
@@ -147,6 +168,116 @@ class ModelWindow(pyglet.window.Window):
 		if symbol == pyglet.window.key.SPACE:
 			self.mode = "depth" if self.mode == "textured" else "textured"
 			self.set_caption(f"merged.gltf | {self.mode}")
+
+	def save_current_view(self) -> None:
+		CAPTURES_PATH.mkdir(parents=True, exist_ok=True)
+		stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+		view_path = CAPTURES_PATH / f"view_{stamp}.png"
+		depth_path = CAPTURES_PATH / f"depth_{stamp}.png"
+		color, depth = self.renderer.render(self.render_scene, flags=pyrender.RenderFlags.RGBA)
+		Image.fromarray(color[:, :, :3], mode="RGB").save(view_path)
+		depth = self.renderer.render(
+			self.render_scene, flags=pyrender.RenderFlags.DEPTH_ONLY
+		)
+		valid = np.isfinite(depth) & (depth > 0.0)
+		depth_image = np.zeros(depth.shape, dtype=np.uint16)
+		if valid.any():
+			nearest = depth[valid].min()
+			farthest = depth[valid].max()
+			if farthest > nearest:
+				depth_image[valid] = np.asarray(
+					(farthest - depth[valid])
+					/ (farthest - nearest)
+					* np.iinfo(np.uint16).max,
+					dtype=np.uint16,
+				)
+			else:
+				depth_image[valid] = np.iinfo(np.uint16).max
+		Image.fromarray(depth_image, mode="I;16").save(depth_path)
+		self.set_caption(f"Saved {view_path.name} and {depth_path.name}")
+
+	def generate_controlnet_view(self) -> None:
+		try:
+			view_path, depth_path = self.save_current_view_files()
+		except Exception as exc:
+			self.set_caption(f"ControlNet capture failed: {exc}")
+			return
+		self.set_caption("Sending RGB/depth view to ControlNet...")
+		threading.Thread(
+			target=self._request_controlnet,
+			args=(view_path, depth_path),
+			daemon=True,
+			name="controlnet-request",
+		).start()
+
+	def save_current_view_files(self) -> tuple[Path, Path]:
+		CAPTURES_PATH.mkdir(parents=True, exist_ok=True)
+		stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+		view_path = CAPTURES_PATH / f"view_{stamp}.png"
+		depth_path = CAPTURES_PATH / f"depth_{stamp}.png"
+		color, depth = self.renderer.render(self.render_scene, flags=pyrender.RenderFlags.RGBA)
+		Image.fromarray(color[:, :, :3], mode="RGB").save(view_path)
+		valid = np.isfinite(depth) & (depth > 0.0)
+		depth_image = np.zeros(depth.shape, dtype=np.uint16)
+		if valid.any():
+			nearest = depth[valid].min()
+			farthest = depth[valid].max()
+			if farthest > nearest:
+				depth_image[valid] = np.asarray(
+					(farthest - depth[valid]) / (farthest - nearest) * np.iinfo(np.uint16).max,
+					dtype=np.uint16,
+				)
+			else:
+				depth_image[valid] = np.iinfo(np.uint16).max
+		Image.fromarray(depth_image, mode="I;16").save(depth_path)
+		return view_path, depth_path
+
+	def _request_controlnet(self, view_path: Path, depth_path: Path) -> None:
+		try:
+			import pika
+			def encode(path: Path) -> str:
+				return base64.b64encode(path.read_bytes()).decode("ascii")
+			request = {
+				"image_base64": encode(view_path),
+				"control_image_base64": encode(depth_path),
+				"prompt": "photorealistic textured reconstruction, natural materials, realistic lighting, preserve exact geometry and composition",
+				"negative_prompt": "changed camera angle, changed geometry, warped structures, extra objects, text, watermark, blur",
+				"steps": 30,
+				"strength": 0.35,
+				"guidance_scale": 7.5,
+				"controlnet_conditioning_scale": 1.0,
+				"seed": 0,
+			}
+			correlation_id = str(uuid.uuid4())
+			connection = pika.BlockingConnection(pika.URLParameters(RABBITMQ_URL))
+			channel = connection.channel()
+			channel.queue_declare(queue=CONTROLNET_QUEUE, durable=True)
+			reply_queue = channel.queue_declare(queue="", exclusive=True).method.queue
+			response: bytes | None = None
+			def on_response(_channel, _method, properties, body: bytes) -> None:
+				nonlocal response
+				if properties.correlation_id == correlation_id:
+					response = body
+			consumer_tag = channel.basic_consume(queue=reply_queue, on_message_callback=on_response, auto_ack=True)
+			channel.basic_publish(
+				exchange="", routing_key=CONTROLNET_QUEUE, body=json.dumps(request).encode("utf-8"),
+				properties=pika.BasicProperties(content_type="application/json", correlation_id=correlation_id, reply_to=reply_queue),
+			)
+			deadline = time.monotonic() + 900.0
+			while response is None:
+				if time.monotonic() >= deadline:
+					raise TimeoutError("ControlNet request timed out")
+				connection.process_data_events(time_limit=1.0)
+			channel.basic_cancel(consumer_tag)
+			connection.close()
+			result = json.loads(response.decode("utf-8"))
+			if not result.get("ok"):
+				raise RuntimeError(result.get("error", "ControlNet worker failed"))
+			output_path = CAPTURES_PATH / f"view_controlnet_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+			output_path.write_bytes(base64.b64decode(result["image_base64"]))
+			self.set_caption(f"ControlNet render saved: {output_path.name}")
+		except Exception as exc:
+			self.set_caption(f"ControlNet request failed: {exc}")
 
 	def on_key_release(self, symbol: int, _modifiers: int) -> None:
 		self.walk_keys.discard(symbol)
