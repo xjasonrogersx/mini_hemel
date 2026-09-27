@@ -1,13 +1,5 @@
 numpy
-Pillow
-pyglet>=1.5,<2
+pyglet
+pyrender==0.1.45
 trimesh
-torch
-transformers
-ultralytics
-scipy
-pyrender
-PyOpenGL==3.1.7
-diffusers
-accelerate
-pika
+networkx>=2.8
