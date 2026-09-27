@@ -9,24 +9,62 @@ from datetime import datetime
 import io
 import json
 import logging
+import os
 from pathlib import Path
 import threading
 import time
 from typing import Any
 import uuid
 
+os.environ.pop("PYOPENGL_PLATFORM", None)
+
 import numpy as np
+
+if not hasattr(np, "infty"):
+    np.infty = np.inf
+if not hasattr(np, "float"):
+    np.float = float
+if not hasattr(np, "int"):
+    np.int = int
+if not hasattr(np, "complex"):
+    np.complex = complex
+if not hasattr(np, "bool"):
+    np.bool = bool
+
+import pyglet
+
+# PyGlet can mutate its app.window weak-set during redraws; snapshotting the
+# list prevents the RuntimeError: Set changed size during iteration seen in this
+# container environment while the viewer is starting.
+if not getattr(pyglet.app.base.EventLoop.idle, "_mini_hemel_patched", False):
+    _pyglet_idle = pyglet.app.base.EventLoop.idle
+
+    def _safe_idle(self):
+        dt = self.clock.update_time()
+        redraw_all = self.clock.call_scheduled_functions(dt)
+        for window in list(pyglet.app.windows):
+            if redraw_all or (window._legacy_invalid and window.invalid):
+                window.switch_to()
+                window.dispatch_event("on_draw")
+                window.flip()
+                window._legacy_invalid = False
+        return self.clock.get_sleep_time(True)
+
+    _safe_idle._mini_hemel_patched = True
+    pyglet.app.base.EventLoop.idle = _safe_idle
+
 from PIL import Image
+import pyrender
 import trimesh
-from trimesh.viewer import SceneViewer
+from types import SimpleNamespace
 from trimesh.transformations import transform_points
 
 
 LOGGER = logging.getLogger(__name__)
 
 
-class CarSegmentationViewer(SceneViewer):
-    """Trimesh viewer with on-demand car segmentation."""
+class CarSegmentationViewer(pyrender.Viewer):
+    """Pyrender-based viewer with on-demand car segmentation."""
 
     def __init__(
         self,
@@ -43,6 +81,7 @@ class CarSegmentationViewer(SceneViewer):
         rabbitmq_url: str,
         diffusion_timeout: float,
     ) -> None:
+        self.trimesh_scene = scene
         self.segmentation_model_path = model_path
         self.segmentation_confidence = confidence
         self.screenshot_dir = screenshot_dir
@@ -69,14 +108,72 @@ class CarSegmentationViewer(SceneViewer):
         self._walk_mode = False
         self._normal_camera_transform = scene.camera_transform.copy()
         self._last_left_click: tuple[float, float, float] | None = None
-        super().__init__(
-            scene,
-            background=(0, 0, 0, 255),
-            caption=(
-                "Trimesh SceneViewer "
-                "(G: top-down, Q: Mask2Former, W: SegFormer, Y: VisDrone YOLO)"
-            ),
+
+        render_scene = pyrender.Scene(
+            bg_color=[0.0, 0.0, 0.0, 0.0],
+            ambient_light=[1.0, 1.0, 1.0],
         )
+        for node_name in scene.graph.nodes_geometry:
+            transform, geometry_name = scene.graph.get(node_name)
+            if geometry_name is None or geometry_name not in scene.geometry:
+                continue
+            geometry = scene.geometry[geometry_name]
+            if not isinstance(geometry, trimesh.Trimesh) or geometry.faces.size == 0:
+                continue
+            render_scene.add(
+                pyrender.Mesh.from_trimesh(geometry, smooth=False), pose=transform
+            )
+
+        camera = scene.camera
+        render_camera = pyrender.PerspectiveCamera(
+            yfov=float(np.deg2rad(camera.fov[1])),
+            aspectRatio=camera.resolution[0] / camera.resolution[1],
+            znear=float(camera.z_near),
+            zfar=float(camera.z_far),
+        )
+        render_scene.add(render_camera, pose=scene.camera_transform)
+
+        super().__init__(
+            render_scene,
+            viewport_size=(int(camera.resolution[0]), int(camera.resolution[1])),
+            viewer_flags={
+                "window_title": "Trimesh SceneViewer",
+                "caption": None,
+            },
+        )
+
+        self.view = {
+            "ball": SimpleNamespace(
+                _pose=scene.camera_transform.copy(),
+                _n_pose=scene.camera_transform.copy(),
+                _target=scene.centroid.copy(),
+                _n_target=scene.centroid.copy(),
+            )
+        }
+        self._redraw = lambda: self._render()
+        self._message_text = (
+            "Trimesh SceneViewer "
+            "(G: top-down, Q: Mask2Former, W: SegFormer, Y: VisDrone YOLO)"
+        )
+
+    def set_caption(self, text: str) -> None:
+        self._message_text = str(text)
+        self._message_opac = 1.0
+
+    def _sync_camera_from_scene(self) -> None:
+        pose = self.trimesh_scene.camera_transform.copy()
+        if hasattr(self, "_trackball"):
+            self._trackball._pose = pose
+            self._trackball._n_pose = pose
+        self.view["ball"]._pose = pose
+        self.view["ball"]._n_pose = pose
+
+    def _sync_scene_from_camera(self) -> None:
+        if hasattr(self, "_trackball"):
+            self.trimesh_scene.camera_transform = self._trackball.pose.copy()
+        else:
+            self.trimesh_scene.camera_transform = self.view["ball"]._pose.copy()
+        self._sync_camera_from_scene()
 
     def on_mouse_press(self, x: int, y: int, buttons: int, modifiers: int) -> None:
         import pyglet
@@ -106,8 +203,19 @@ class CarSegmentationViewer(SceneViewer):
             return
         super().on_mouse_drag(x, y, dx, dy, buttons, modifiers)
 
+    def _set_camera_pose(self, pose: np.ndarray) -> None:
+        pose = np.asarray(pose, dtype=np.float64)
+        self.trimesh_scene.camera_transform = pose.copy()
+        if hasattr(self, "_camera_node"):
+            self._camera_node.matrix = pose.copy()
+        if hasattr(self, "_trackball"):
+            self._trackball._pose = pose.copy()
+            self._trackball._n_pose = pose.copy()
+        self.view["ball"]._pose = pose.copy()
+        self.view["ball"]._n_pose = pose.copy()
+
     def _walk_mouse_look(self, dx: int, dy: int) -> None:
-        rotation = self.scene.camera_transform[:3, :3]
+        rotation = self.trimesh_scene.camera_transform[:3, :3]
         forward = -rotation[:, 2]
         world_up = np.array([0.0, 1.0, 0.0])
         right = rotation[:, 0]
@@ -129,23 +237,21 @@ class CarSegmentationViewer(SceneViewer):
         right = np.cross(forward, world_up)
         right /= np.linalg.norm(right)
         up = np.cross(right, forward)
-        camera_transform = self.scene.camera_transform.copy()
+        camera_transform = self.trimesh_scene.camera_transform.copy()
         camera_transform[:3, :3] = np.column_stack((right, up, -forward))
-        self.scene.camera_transform = camera_transform
-        self.view["ball"]._pose = camera_transform
-        self.view["ball"]._n_pose = camera_transform
+        self._set_camera_pose(camera_transform)
         self._redraw()
 
     def _highest_triangle_y(self, x: float, z: float) -> float | None:
         highest_y: float | None = None
-        tolerance = max(float(self.scene.scale) * 1e-6, 1e-6)
+        tolerance = max(float(self.trimesh_scene.scale) * 1e-6, 1e-6)
         point = np.array([x, z])
 
-        for node_name in self.scene.graph.nodes_geometry:
-            transform, geometry_name = self.scene.graph.get(node_name)
-            if geometry_name is None or geometry_name not in self.scene.geometry:
+        for node_name in self.trimesh_scene.graph.nodes_geometry:
+            transform, geometry_name = self.trimesh_scene.graph.get(node_name)
+            if geometry_name is None or geometry_name not in self.trimesh_scene.geometry:
                 continue
-            geometry = self.scene.geometry[geometry_name]
+            geometry = self.trimesh_scene.geometry[geometry_name]
             if not isinstance(geometry, trimesh.Trimesh) or geometry.faces.size == 0:
                 continue
 
@@ -201,16 +307,16 @@ class CarSegmentationViewer(SceneViewer):
         self, x: float, z: float, maximum_y: float, excluded_node: str
     ) -> float | None:
         highest_y: float | None = None
-        tolerance = max(float(self.scene.scale) * 1e-6, 1e-6)
+        tolerance = max(float(self.trimesh_scene.scale) * 1e-6, 1e-6)
         point = np.array([x, z])
 
-        for node_name in self.scene.graph.nodes_geometry:
+        for node_name in self.trimesh_scene.graph.nodes_geometry:
             if node_name == excluded_node:
                 continue
-            transform, geometry_name = self.scene.graph.get(node_name)
-            if geometry_name is None or geometry_name not in self.scene.geometry:
+            transform, geometry_name = self.trimesh_scene.graph.get(node_name)
+            if geometry_name is None or geometry_name not in self.trimesh_scene.geometry:
                 continue
-            geometry = self.scene.geometry[geometry_name]
+            geometry = self.trimesh_scene.geometry[geometry_name]
             if not isinstance(geometry, trimesh.Trimesh) or geometry.faces.size == 0:
                 continue
 
@@ -254,8 +360,8 @@ class CarSegmentationViewer(SceneViewer):
         return highest_y
 
     def _move_camera_above_click(self, x: int, y: int) -> None:
-        origins, directions, pixels = self.scene.camera_rays()
-        _, height = map(int, self.scene.camera.resolution)
+        origins, directions, pixels = self.trimesh_scene.camera_rays()
+        _, height = map(int, self.trimesh_scene.camera.resolution)
         pixel = np.array([height - 1 - int(y), int(x)])
         matches = np.flatnonzero(np.all(pixels == pixel, axis=1))
         ray_index = int(matches[0]) if len(matches) else int(
@@ -268,7 +374,7 @@ class CarSegmentationViewer(SceneViewer):
             self.set_caption("Could not find a model surface at the clicked point")
             return
 
-        camera_transform = self.scene.camera_transform.copy()
+        camera_transform = self.trimesh_scene.camera_transform.copy()
         forward = -camera_transform[:3, 2].copy()
         forward[1] = 0.0
         forward_length = np.linalg.norm(forward)
@@ -282,7 +388,7 @@ class CarSegmentationViewer(SceneViewer):
         up = np.cross(right, forward)
         camera_transform[:3, :3] = np.column_stack((right, up, -forward))
         camera_transform[:3, 3] = street_point + np.array([0.0, 3.0, 0.0])
-        self.scene.camera_transform = camera_transform
+        self.trimesh_scene.camera_transform = camera_transform
         self.view["ball"]._pose = camera_transform
         self.view["ball"]._n_pose = camera_transform
         self.view["ball"]._target = street_point
@@ -299,13 +405,13 @@ class CarSegmentationViewer(SceneViewer):
     ) -> np.ndarray | None:
         closest_distance = np.inf
         closest_point: np.ndarray | None = None
-        epsilon = max(float(self.scene.scale) * 1e-8, 1e-8)
+        epsilon = max(float(self.trimesh_scene.scale) * 1e-8, 1e-8)
 
-        for node_name in self.scene.graph.nodes_geometry:
-            transform, geometry_name = self.scene.graph.get(node_name)
-            if geometry_name is None or geometry_name not in self.scene.geometry:
+        for node_name in self.trimesh_scene.graph.nodes_geometry:
+            transform, geometry_name = self.trimesh_scene.graph.get(node_name)
+            if geometry_name is None or geometry_name not in self.trimesh_scene.geometry:
                 continue
-            geometry = self.scene.geometry[geometry_name]
+            geometry = self.trimesh_scene.geometry[geometry_name]
             if not isinstance(geometry, trimesh.Trimesh) or geometry.faces.size == 0:
                 continue
 
@@ -366,6 +472,13 @@ class CarSegmentationViewer(SceneViewer):
             self.enhance_current_view()
             return
         if symbol == self._key("G"):
+            if self._walk_mode:
+                self._walk_mode = False
+                self.set_caption(
+                    "Trimesh SceneViewer "
+                    "(G: top-down, Q: Mask2Former, W: SegFormer, Y: VisDrone YOLO)"
+                )
+                return
             self._walk_mode = False
             self.toggle_top_down_view()
             return
@@ -381,7 +494,7 @@ class CarSegmentationViewer(SceneViewer):
         super().on_key_press(symbol, modifiers)
 
     def _walk_forward(self, direction: float) -> None:
-        camera_transform = self.scene.camera_transform.copy()
+        camera_transform = self.trimesh_scene.camera_transform.copy()
         current_position = camera_transform[:3, 3].copy()
         current_ground = self._highest_triangle_y(
             current_position[0], current_position[2]
@@ -391,7 +504,7 @@ class CarSegmentationViewer(SceneViewer):
         if forward_length <= 1e-8:
             return
         forward /= forward_length
-        distance = max(float(self.scene.scale) * 0.01, 0.02)
+        distance = max(float(self.trimesh_scene.scale) * 0.01, 0.02)
         next_position = current_position + direction * distance * forward
         if current_ground is not None:
             next_ground = self._highest_triangle_y(
@@ -400,29 +513,23 @@ class CarSegmentationViewer(SceneViewer):
             if next_ground is not None:
                 next_position[1] = current_position[1] - current_ground + next_ground
         camera_transform[:3, 3] = next_position
-        self.scene.camera_transform = camera_transform
-        self.view["ball"]._pose = camera_transform
-        self.view["ball"]._n_pose = camera_transform
+        self._set_camera_pose(camera_transform)
         self._redraw()
 
     def _walk_turn(self, direction: float) -> None:
-        camera_transform = self.scene.camera_transform.copy()
+        camera_transform = self.trimesh_scene.camera_transform.copy()
         angle = direction * 0.03
         world_up = np.array([0.0, 1.0, 0.0])
         yaw = trimesh.transformations.rotation_matrix(angle, world_up)
         camera_transform[:3, :3] = yaw[:3, :3].dot(camera_transform[:3, :3])
-        self.scene.camera_transform = camera_transform
-        self.view["ball"]._pose = camera_transform
-        self.view["ball"]._n_pose = camera_transform
+        self._set_camera_pose(camera_transform)
         self._redraw()
 
     def _walk_vertical(self, direction: float) -> None:
-        camera_transform = self.scene.camera_transform.copy()
-        distance = max(float(self.scene.scale) * 0.01, 0.02)
+        camera_transform = self.trimesh_scene.camera_transform.copy()
+        distance = max(float(self.trimesh_scene.scale) * 0.01, 0.02)
         camera_transform[1, 3] += direction * distance
-        self.scene.camera_transform = camera_transform
-        self.view["ball"]._pose = camera_transform
-        self.view["ball"]._n_pose = camera_transform
+        self._set_camera_pose(camera_transform)
         self._redraw()
 
     @staticmethod
@@ -445,25 +552,25 @@ class CarSegmentationViewer(SceneViewer):
         render_scene = pyrender.Scene(
             bg_color=[0.0, 0.0, 0.0, 0.0], ambient_light=[1.0, 1.0, 1.0]
         )
-        for node_name in self.scene.graph.nodes_geometry:
-            transform, geometry_name = self.scene.graph.get(node_name)
-            if geometry_name is None or geometry_name not in self.scene.geometry:
+        for node_name in self.trimesh_scene.graph.nodes_geometry:
+            transform, geometry_name = self.trimesh_scene.graph.get(node_name)
+            if geometry_name is None or geometry_name not in self.trimesh_scene.geometry:
                 continue
-            geometry = self.scene.geometry[geometry_name]
+            geometry = self.trimesh_scene.geometry[geometry_name]
             if not isinstance(geometry, trimesh.Trimesh) or geometry.faces.size == 0:
                 continue
             render_scene.add(
                 pyrender.Mesh.from_trimesh(geometry, smooth=False), pose=transform
             )
 
-        camera = self.scene.camera
+        camera = self.trimesh_scene.camera
         render_camera = pyrender.PerspectiveCamera(
             yfov=float(np.deg2rad(camera.fov[1])),
             aspectRatio=width / height,
             znear=float(camera.z_near),
             zfar=float(camera.z_far),
         )
-        render_scene.add(render_camera, pose=self.scene.camera_transform)
+        render_scene.add(render_camera, pose=self.trimesh_scene.camera_transform)
         return render_scene
 
     def _capture_pyrender_images(
@@ -510,8 +617,8 @@ class CarSegmentationViewer(SceneViewer):
 
     def save_current_view(self) -> None:
         try:
-            _, height = map(int, self.scene.camera.resolution)
-            width = int(self.scene.camera.resolution[0])
+            _, height = map(int, self.trimesh_scene.camera.resolution)
+            width = int(self.trimesh_scene.camera.resolution[0])
             self.screenshot_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             output_path = self.screenshot_dir / f"view_{timestamp}.png"
@@ -660,12 +767,12 @@ class CarSegmentationViewer(SceneViewer):
         overlay_names = set(self.red_highlight_geometry)
         overlay_names.update(
             name
-            for name in self.scene.geometry
+            for name in self.trimesh_scene.geometry
             if name.startswith(overlay_prefixes)
         )
         for geometry_name in overlay_names:
-            if geometry_name in self.scene.geometry:
-                self.scene.delete_geometry(geometry_name)
+            if geometry_name in self.trimesh_scene.geometry:
+                self.trimesh_scene.delete_geometry(geometry_name)
         self.red_highlight_geometry.clear()
         self.cleanup_geometries()
 
@@ -782,9 +889,7 @@ class CarSegmentationViewer(SceneViewer):
 
     def toggle_top_down_view(self) -> None:
         if self._top_down:
-            self.scene.camera_transform = self._normal_camera_transform.copy()
-            self.view["ball"]._pose = self.scene.camera_transform
-            self.view["ball"]._n_pose = self.scene.camera_transform
+            self._set_camera_pose(self._normal_camera_transform.copy())
             self._top_down = False
             self.set_caption(
                 "Trimesh SceneViewer "
@@ -801,15 +906,13 @@ class CarSegmentationViewer(SceneViewer):
                 [0.0, 0.0, 0.0, 1.0],
             ]
         )
-        top_down = self.scene.camera.look_at(
-            self.scene.bounds,
+        top_down = self.trimesh_scene.camera.look_at(
+            self.trimesh_scene.bounds,
             rotation=rotation,
-            center=self.scene.centroid,
+            center=self.trimesh_scene.centroid,
             pad=1.2,
         )
-        self.scene.camera_transform = top_down
-        self.view["ball"]._pose = top_down
-        self.view["ball"]._n_pose = top_down
+        self._set_camera_pose(top_down)
         self._top_down = True
         self.set_caption(
             "Trimesh SceneViewer "
@@ -819,13 +922,13 @@ class CarSegmentationViewer(SceneViewer):
 
     def _project(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         camera_points = transform_points(
-            points, np.linalg.inv(self.scene.camera_transform)
+            points, np.linalg.inv(self.trimesh_scene.camera_transform)
         )
         z = -camera_points[:, 2]
         visible = z > 0
         pixels = np.zeros((len(points), 2), dtype=np.float64)
-        focal = self.scene.camera.focal
-        center = self.scene.camera.resolution / 2.0
+        focal = self.trimesh_scene.camera.focal
+        center = self.trimesh_scene.camera.resolution / 2.0
         pixels[:, 0] = focal[0] * camera_points[:, 0] / np.maximum(z, 1e-8) + center[0]
         pixels[:, 1] = center[1] - (
             focal[1] * camera_points[:, 1] / np.maximum(z, 1e-8)
@@ -834,14 +937,14 @@ class CarSegmentationViewer(SceneViewer):
 
     def _highlight_faces(self, mask: np.ndarray) -> None:
         width, height = mask.shape[1], mask.shape[0]
-        scale = max(float(self.scene.scale), 1.0)
+        scale = max(float(self.trimesh_scene.scale), 1.0)
         self.detected_car_triangles.clear()
         self.detected_face_records.clear()
-        for node_name in list(self.scene.graph.nodes_geometry):
-            transform, geometry_name = self.scene.graph.get(node_name)
-            if geometry_name is None or geometry_name not in self.scene.geometry:
+        for node_name in list(self.trimesh_scene.graph.nodes_geometry):
+            transform, geometry_name = self.trimesh_scene.graph.get(node_name)
+            if geometry_name is None or geometry_name not in self.trimesh_scene.geometry:
                 continue
-            geometry = self.scene.geometry[geometry_name]
+            geometry = self.trimesh_scene.geometry[geometry_name]
             if not isinstance(geometry, trimesh.Trimesh) or geometry.faces.size == 0:
                 continue
 
@@ -886,7 +989,7 @@ class CarSegmentationViewer(SceneViewer):
                 (len(selected_triangles), 1),
             )
             overlay_name = f"__car_highlight_{len(self.red_highlight_geometry)}"
-            self.scene.add_geometry(overlay, geom_name=overlay_name)
+            self.trimesh_scene.add_geometry(overlay, geom_name=overlay_name)
             self.red_highlight_geometry.append(overlay_name)
 
     def flatten_detected_cars(self) -> None:
@@ -904,10 +1007,10 @@ class CarSegmentationViewer(SceneViewer):
         self._remove_highlights()
         selected_by_node: dict[str, np.ndarray] = {}
         for node_name, geometry_name, selected in records:
-            if node_name not in self.scene.graph.nodes_geometry:
+            if node_name not in self.trimesh_scene.graph.nodes_geometry:
                 continue
-            _, current_geometry_name = self.scene.graph.get(node_name)
-            geometry = self.scene.geometry.get(current_geometry_name)
+            _, current_geometry_name = self.trimesh_scene.graph.get(node_name)
+            geometry = self.trimesh_scene.geometry.get(current_geometry_name)
             if not isinstance(geometry, trimesh.Trimesh):
                 continue
             if len(selected) != len(geometry.faces):
@@ -921,8 +1024,8 @@ class CarSegmentationViewer(SceneViewer):
 
         selected_faces_count = 0
         for node_name, selected in selected_by_node.items():
-            transform, geometry_name = self.scene.graph.get(node_name)
-            geometry = self.scene.geometry[geometry_name]
+            transform, geometry_name = self.trimesh_scene.graph.get(node_name)
+            geometry = self.trimesh_scene.geometry[geometry_name]
             if not selected.any():
                 continue
 
