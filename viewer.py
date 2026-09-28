@@ -274,7 +274,13 @@ class ModelWindow(pyglet.window.Window):
 				raise RuntimeError(result.get("error", "ControlNet worker failed"))
 			output_path = CAPTURES_PATH / f"view_controlnet_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
 			output_path.write_bytes(base64.b64decode(result["image_base64"]))
-			self.set_caption(f"ControlNet render saved: {output_path.name}")
+			iterations = result.get("iterations", request["steps"])
+			requested_iterations = result.get("requested_iterations", request["steps"])
+			duration = result.get("duration_seconds")
+			self.set_caption(
+				f"ControlNet render saved: {output_path.name} | "
+				f"iterations: {iterations}/{requested_iterations} | duration: {duration}s"
+			)
 		except Exception as exc:
 			self.set_caption(f"ControlNet request failed: {exc}")
 
