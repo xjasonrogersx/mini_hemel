@@ -80,7 +80,6 @@ class ControlNetWorker:
             pipeline_kwargs = {
                 "prompt": prompt,
                 "negative_prompt": negative_prompt,
-                "control_image": control,
                 "num_inference_steps": requested_iterations,
                 "guidance_scale": float(request.get("guidance_scale", 7.5)),
                 "controlnet_conditioning_scale": float(
@@ -93,7 +92,9 @@ class ControlNetWorker:
                     self.text_pipeline = StableDiffusionControlNetPipeline.from_pipe(
                         self.pipeline
                     )
-                result = self.text_pipeline(**pipeline_kwargs).images[0]
+                result = self.text_pipeline(
+                    image=control, **pipeline_kwargs
+                ).images[0]
             elif mode == "img2img":
                 image = Image.open(
                     io.BytesIO(base64.b64decode(request["image_base64"]))
@@ -101,6 +102,7 @@ class ControlNetWorker:
                 result = self.pipeline(
                     image=image,
                     strength=float(request.get("strength", 0.35)),
+                    control_image=control,
                     **pipeline_kwargs,
                 ).images[0]
             else:
