@@ -289,6 +289,18 @@ and inference duration. A successful response includes the same metadata:
 }
 ```
 
+To compare the worker with the Hugging Face depth example, use the standalone
+test client. It defaults to depth-only text-to-image, so the RGB image is not
+used as the generation source:
+
+```bash
+RABBITMQ_URL=amqp://guest:guest@192.168.1.252:5672/%2F \
+python3 controlnet_test.py
+```
+
+Use `--mode img2img` to start from the RGB input instead. The worker must be
+restarted after changing its code.
+
 ## 4. Start the worker
 
 Use the snapshot path discovered above:

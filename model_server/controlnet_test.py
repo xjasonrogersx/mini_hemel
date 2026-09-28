@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send a depth ControlNet img2img request through RabbitMQ."""
+"""Send a depth ControlNet text-to-image or img2img request through RabbitMQ."""
 
 from __future__ import annotations
 
@@ -55,10 +55,11 @@ def request_controlnet(
     guidance_scale: float,
     controlnet_conditioning_scale: float,
     seed: int,
+    mode: str,
 ) -> None:
     request = {
-        "image_base64": encode_png(image_path, "color"),
         "control_image_base64": encode_png(depth_path, "depth"),
+        "mode": mode,
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "steps": steps,
@@ -67,6 +68,8 @@ def request_controlnet(
         "controlnet_conditioning_scale": controlnet_conditioning_scale,
         "seed": seed,
     }
+    if mode == "img2img":
+        request["image_base64"] = encode_png(image_path, "color")
     print(f"Positive prompt: {prompt}")
     print(f"Negative prompt: {negative_prompt}")
     correlation_id = str(uuid.uuid4())
@@ -155,6 +158,12 @@ def main() -> None:
     parser.add_argument("--guidance-scale", type=float, default=5.5)
     parser.add_argument("--controlnet-conditioning-scale", type=float, default=1.25)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--mode",
+        choices=("text2img", "img2img"),
+        default="text2img",
+        help="Use depth-only text-to-image like the Hugging Face example, or RGB img2img",
+    )
     args = parser.parse_args()
 
     for path in (args.image, args.depth):
@@ -174,6 +183,7 @@ def main() -> None:
         args.guidance_scale,
         args.controlnet_conditioning_scale,
         args.seed,
+        args.mode,
     )
 
 

@@ -14,7 +14,11 @@ from typing import Any
 import numpy as np
 import pika
 import torch
-from diffusers import ControlNetModel, StableDiffusionControlNetImg2ImgPipeline
+from diffusers import (
+    ControlNetModel,
+    StableDiffusionControlNetImg2ImgPipeline,
+    StableDiffusionControlNetPipeline,
+)
 from PIL import Image
 
 
@@ -36,14 +40,17 @@ class ControlNetWorker:
             self.pipeline.enable_attention_slicing()
         self.queue = args.queue
         self.rabbitmq_url = args.rabbitmq_url
+        self.text_pipeline: StableDiffusionControlNetPipeline | None = None
 
     def process(self, request: dict[str, Any]) -> tuple[str, int, int, float]:
         requested_iterations = int(request.get("steps", 30))
         strength = float(request.get("strength", 0.35))
         iterations = max(1, min(requested_iterations, int(requested_iterations * strength)))
         started_at = time.monotonic()
+        mode = request.get("mode", "img2img")
         LOGGER.info(
-            "ControlNet request started: requested_iterations=%d effective_iterations=%d strength=%.3f guidance=%.2f control_scale=%.2f device=%s",
+            "ControlNet request started: mode=%s requested_iterations=%d effective_iterations=%d strength=%.3f guidance=%.2f control_scale=%.2f device=%s",
+            mode,
             requested_iterations,
             iterations,
             strength,
@@ -51,7 +58,6 @@ class ControlNetWorker:
             float(request.get("controlnet_conditioning_scale", 1.0)),
             self.device_name,
         )
-        image = Image.open(io.BytesIO(base64.b64decode(request["image_base64"]))).convert("RGB")
         control_source = Image.open(
             io.BytesIO(base64.b64decode(request["control_image_base64"]))
         )
@@ -60,24 +66,45 @@ class ControlNetWorker:
             control_source = Image.fromarray((control16 / 257.0).astype(np.uint8), mode="L")
         control = control_source.convert("RGB")
         LOGGER.info(
-            "ControlNet inputs rgb=%s control_mode=%s control_size=%s",
-            image.size,
+            "ControlNet inputs mode=%s control_mode=%s control_size=%s",
+            mode,
             control_source.mode,
             control.size,
         )
         generator = torch.Generator(device="cpu").manual_seed(int(request.get("seed", 0)))
+        prompt = request.get(
+            "prompt", "photorealistic textured reconstruction, realistic materials and lighting"
+        )
+        negative_prompt = request.get("negative_prompt")
         with torch.inference_mode():
-            result = self.pipeline(
-                prompt=request.get("prompt", "photorealistic textured reconstruction, realistic materials and lighting"),
-                negative_prompt=request.get("negative_prompt"),
-                image=image,
-                control_image=control,
-                strength=float(request.get("strength", 0.35)),
-                num_inference_steps=requested_iterations,
-                guidance_scale=float(request.get("guidance_scale", 7.5)),
-                controlnet_conditioning_scale=float(request.get("controlnet_conditioning_scale", 1.0)),
-                generator=generator,
-            ).images[0]
+            pipeline_kwargs = {
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "control_image": control,
+                "num_inference_steps": requested_iterations,
+                "guidance_scale": float(request.get("guidance_scale", 7.5)),
+                "controlnet_conditioning_scale": float(
+                    request.get("controlnet_conditioning_scale", 1.0)
+                ),
+                "generator": generator,
+            }
+            if mode == "text2img":
+                if self.text_pipeline is None:
+                    self.text_pipeline = StableDiffusionControlNetPipeline.from_pipe(
+                        self.pipeline
+                    )
+                result = self.text_pipeline(**pipeline_kwargs).images[0]
+            elif mode == "img2img":
+                image = Image.open(
+                    io.BytesIO(base64.b64decode(request["image_base64"]))
+                ).convert("RGB")
+                result = self.pipeline(
+                    image=image,
+                    strength=float(request.get("strength", 0.35)),
+                    **pipeline_kwargs,
+                ).images[0]
+            else:
+                raise ValueError(f"unsupported ControlNet mode: {mode}")
         output = io.BytesIO()
         result.save(output, format="PNG")
         duration = time.monotonic() - started_at
