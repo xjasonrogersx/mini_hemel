@@ -249,7 +249,9 @@ class ModelWindow(pyglet.window.Window):
 				"seed": 0,
 			}
 			correlation_id = str(uuid.uuid4())
-			connection = pika.BlockingConnection(pika.URLParameters(RABBITMQ_URL))
+			parameters = pika.URLParameters(RABBITMQ_URL)
+			parameters.heartbeat = 0
+			connection = pika.BlockingConnection(parameters)
 			channel = connection.channel()
 			channel.queue_declare(queue=CONTROLNET_QUEUE, durable=True)
 			reply_queue = channel.queue_declare(queue="", exclusive=True).method.queue
@@ -263,10 +265,7 @@ class ModelWindow(pyglet.window.Window):
 				exchange="", routing_key=CONTROLNET_QUEUE, body=json.dumps(request).encode("utf-8"),
 				properties=pika.BasicProperties(content_type="application/json", correlation_id=correlation_id, reply_to=reply_queue),
 			)
-			deadline = time.monotonic() + 900.0
 			while response is None:
-				if time.monotonic() >= deadline:
-					raise TimeoutError("ControlNet request timed out")
 				connection.process_data_events(time_limit=1.0)
 			channel.basic_cancel(consumer_tag)
 			connection.close()

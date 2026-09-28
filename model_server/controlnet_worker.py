@@ -55,7 +55,10 @@ class ControlNetWorker:
         return base64.b64encode(output.getvalue()).decode("ascii")
 
     def run(self) -> None:
-        connection = pika.BlockingConnection(pika.URLParameters(self.rabbitmq_url))
+        parameters = pika.URLParameters(self.rabbitmq_url)
+        # Inference can take longer than RabbitMQ's default heartbeat interval.
+        parameters.heartbeat = 0
+        connection = pika.BlockingConnection(parameters)
         channel = connection.channel()
         channel.queue_declare(queue=self.queue, durable=True)
         channel.basic_qos(prefetch_count=1)
@@ -65,7 +68,13 @@ class ControlNetWorker:
             except Exception as exc:
                 LOGGER.exception("ControlNet request failed")
                 response = {"ok": False, "error": str(exc)}
-            channel.basic_publish(exchange="", routing_key=properties.reply_to, body=json.dumps(response).encode("utf-8"), properties=pika.BasicProperties(content_type="application/json", correlation_id=properties.correlation_id))
+            try:
+                channel.basic_publish(exchange="", routing_key=properties.reply_to, body=json.dumps(response).encode("utf-8"), properties=pika.BasicProperties(content_type="application/json", correlation_id=properties.correlation_id))
+            except pika.exceptions.AMQPError:
+                LOGGER.warning(
+                    "ControlNet client disconnected before the result could be returned",
+                    exc_info=True,
+                )
             channel.basic_ack(delivery_tag=method.delivery_tag)
         channel.basic_consume(queue=self.queue, on_message_callback=on_request)
         LOGGER.info("Waiting for ControlNet requests on %s", self.queue)
