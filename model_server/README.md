@@ -275,7 +275,19 @@ RABBITMQ_URL=amqp://guest:guest@172.17.0.1:5672/%2F python3 ../viewer.py
 
 Alternatively, run the worker and viewer on the same host as RabbitMQ and use
 the default `localhost` URL. Press `Q` after the worker reports that it is
-waiting for requests. The generated image is saved in `captures/`.
+waiting for requests. The generated image is saved in `captures/`. The worker
+logs the device, request settings, input modes, effective/requested iterations,
+and inference duration. A successful response includes the same metadata:
+
+```json
+{
+	"ok": true,
+	"image_base64": "<generated PNG bytes encoded as base64>",
+	"iterations": 6,
+	"requested_iterations": 30,
+	"duration_seconds": 18.2
+}
+```
 
 ## 4. Start the worker
 

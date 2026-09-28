@@ -11,6 +11,7 @@ import logging
 import time
 from typing import Any
 
+import numpy as np
 import pika
 import torch
 from diffusers import ControlNetModel, StableDiffusionControlNetImg2ImgPipeline
@@ -51,7 +52,19 @@ class ControlNetWorker:
             self.device_name,
         )
         image = Image.open(io.BytesIO(base64.b64decode(request["image_base64"]))).convert("RGB")
-        control = Image.open(io.BytesIO(base64.b64decode(request["control_image_base64"]))).convert("L").convert("RGB")
+        control_source = Image.open(
+            io.BytesIO(base64.b64decode(request["control_image_base64"]))
+        )
+        if control_source.mode == "I;16":
+            control16 = np.asarray(control_source, dtype=np.uint16)
+            control_source = Image.fromarray((control16 / 257.0).astype(np.uint8), mode="L")
+        control = control_source.convert("RGB")
+        LOGGER.info(
+            "ControlNet inputs rgb=%s control_mode=%s control_size=%s",
+            image.size,
+            control_source.mode,
+            control.size,
+        )
         generator = torch.Generator(device="cpu").manual_seed(int(request.get("seed", 0)))
         with torch.inference_mode():
             result = self.pipeline(

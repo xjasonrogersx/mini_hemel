@@ -5,6 +5,7 @@ from datetime import datetime
 import base64
 import io
 import json
+import logging
 import math
 import os
 import threading
@@ -29,6 +30,7 @@ CONTROLNET_QUEUE = "stable-diffusion-controlnet"
 RABBITMQ_URL = os.getenv(
 	"RABBITMQ_URL", "amqp://guest:guest@localhost:5672/%2F"
 )
+LOGGER = logging.getLogger(__name__)
 
 
 def load_scene(asset_path: Path) -> tuple[pyrender.Scene, pyrender.PerspectiveCamera]:
@@ -182,8 +184,7 @@ class ModelWindow(pyglet.window.Window):
 		valid = np.isfinite(depth) & (depth > 0.0)
 		depth_image = np.zeros(depth.shape, dtype=np.uint16)
 		if valid.any():
-			nearest = depth[valid].min()
-			farthest = depth[valid].max()
+			nearest, farthest = np.percentile(depth[valid], [2.0, 98.0])
 			if farthest > nearest:
 				depth_image[valid] = np.asarray(
 					(farthest - depth[valid])
@@ -230,6 +231,13 @@ class ModelWindow(pyglet.window.Window):
 			else:
 				depth_image[valid] = np.iinfo(np.uint16).max
 		Image.fromarray(depth_image, mode="I;16").save(depth_path)
+		LOGGER.info(
+			"Saved ControlNet capture rgb=%s depth=%s valid_depth_range=%.3f..%.3f",
+			view_path.name,
+			depth_path.name,
+			float(nearest) if valid.any() else 0.0,
+			float(farthest) if valid.any() else 0.0,
+		)
 		return view_path, depth_path
 
 	def _request_controlnet(self, view_path: Path, depth_path: Path) -> None:
@@ -243,11 +251,18 @@ class ModelWindow(pyglet.window.Window):
 				"prompt": "photorealistic textured reconstruction, natural materials, realistic lighting, preserve exact geometry and composition",
 				"negative_prompt": "changed camera angle, changed geometry, warped structures, extra objects, text, watermark, blur",
 				"steps": 30,
-				"strength": 0.35,
-				"guidance_scale": 7.5,
-				"controlnet_conditioning_scale": 1.0,
+				"strength": 0.20,
+				"guidance_scale": 5.5,
+				"controlnet_conditioning_scale": 1.25,
 				"seed": 0,
 			}
+			LOGGER.info(
+				"Sending ControlNet request steps=%d strength=%.2f guidance=%.2f control_scale=%.2f",
+				request["steps"],
+				request["strength"],
+				request["guidance_scale"],
+				request["controlnet_conditioning_scale"],
+			)
 			correlation_id = str(uuid.uuid4())
 			parameters = pika.URLParameters(RABBITMQ_URL)
 			parameters.heartbeat = 0
@@ -274,6 +289,13 @@ class ModelWindow(pyglet.window.Window):
 				raise RuntimeError(result.get("error", "ControlNet worker failed"))
 			output_path = CAPTURES_PATH / f"view_controlnet_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
 			output_path.write_bytes(base64.b64decode(result["image_base64"]))
+			LOGGER.info(
+				"ControlNet response received iterations=%s/%s duration=%ss output=%s",
+				result.get("iterations", "?"),
+				result.get("requested_iterations", "?"),
+				result.get("duration_seconds", "?"),
+				output_path.name,
+			)
 			iterations = result.get("iterations", request["steps"])
 			requested_iterations = result.get("requested_iterations", request["steps"])
 			duration = result.get("duration_seconds")
@@ -567,4 +589,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+	logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 	main()
