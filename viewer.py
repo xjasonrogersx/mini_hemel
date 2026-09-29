@@ -248,8 +248,8 @@ class ModelWindow(pyglet.window.Window):
 			request = {
 				"image_base64": encode(view_path),
 				"control_image_base64": encode(depth_path),
-				"prompt": "photorealistic textured reconstruction, natural materials, realistic lighting, preserve exact geometry and composition",
-				"negative_prompt": "changed camera angle, changed geometry, warped structures, extra objects, text, watermark, blur",
+				"prompt": "highly realistic photorealistic building scene, detailed concrete and stone architecture, realistic windows and roofs, natural vegetation, daylight, sharp materials, preserve the exact geometry and composition",
+				"negative_prompt": "changed camera angle, changed composition, warped geometry, distorted buildings, extra buildings, floating objects, text, watermark, blur",
 				"steps": 30,
 				"strength": 0.20,
 				"guidance_scale": 5.5,
