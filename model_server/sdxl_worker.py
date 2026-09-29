@@ -43,8 +43,7 @@ DEFAULT_NEGATIVE_PROMPT = (
     "cartoon, illustration, painting, watermark, logo, text, duplicate buildings, "
     "warped geometry, distorted structures, deformed roofs, blurry, low quality"
 )
-# Phase 3: a lower denoising strength preserves mesh geometry and produces
-# cleaner reprojection than the SD 1.5 ControlNet worker's default.
+# Keep the input image strongly anchored during the first quality pass.
 DEFAULT_STRENGTH = 0.18
 
 
@@ -73,7 +72,7 @@ class SDXLWorker:
     def process(self, request: dict[str, Any]) -> tuple[str, int, int, float]:
         requested_iterations = int(request.get("steps", 30))
         strength = float(request.get("strength", DEFAULT_STRENGTH))
-        iterations = max(1, min(requested_iterations, int(requested_iterations * strength)))
+        iterations = max(1, requested_iterations)
         started_at = time.monotonic()
         mode = request.get("mode", "img2img")
         LOGGER.info(

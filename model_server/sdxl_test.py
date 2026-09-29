@@ -19,9 +19,9 @@ from PIL import Image
 DEFAULT_RABBITMQ_URL = "amqp://guest:guest@192.168.1.252:5672/%2F"
 DEFAULT_QUEUE = "stable-diffusion-controlnet-sdxl"
 DEFAULT_PROMPT = (
-    "high resolution aerial photogrammetry texture, realistic building materials, "
-    "detailed rooftops, clean facade textures, sharp roads, realistic vegetation, "
-    "survey grade reconstruction, high frequency detail, consistent lighting"
+    "photorealistic aerial 3D town reconstruction, realistic roof and facade materials, "
+    "crisp architectural details, natural vegetation, accurate roads and building layout, "
+    "sharp focus, consistent daylight, high quality"
 )
 DEFAULT_NEGATIVE_PROMPT = (
     "cartoon, illustration, painting, watermark, logo, text, duplicate buildings, "
@@ -155,14 +155,14 @@ def main() -> None:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--negative-prompt", default=DEFAULT_NEGATIVE_PROMPT)
     parser.add_argument("--steps", type=int, default=30)
-    parser.add_argument("--strength", type=float, default=0.18)
-    parser.add_argument("--guidance-scale", type=float, default=5.5)
-    parser.add_argument("--controlnet-conditioning-scale", type=float, default=1.25)
+    parser.add_argument("--strength", type=float, default=0.30)
+    parser.add_argument("--guidance-scale", type=float, default=5.0)
+    parser.add_argument("--controlnet-conditioning-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--mode",
         choices=("text2img", "img2img"),
-        default="text2img",
+        default="img2img",
         help="Use depth-only text-to-image like the Hugging Face example, or RGB img2img",
     )
     args = parser.parse_args()
