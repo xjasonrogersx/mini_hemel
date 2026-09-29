@@ -133,3 +133,9 @@ python3 viewer.py
 ```
 
 The generated image is saved in `captures/` as `view_sdxl_<timestamp>.png`.
+
+
+<img width="1261" height="740" alt="image" src="https://github.com/user-attachments/assets/15857e07-fdf6-4675-97c6-6f0e44e6054e" />
+
+<img width="1251" height="710" alt="image" src="https://github.com/user-attachments/assets/fd1af397-f8ae-4721-8f4c-25e22fe8bc34" />
+
