@@ -12,8 +12,28 @@ The workers use separate queues so they can run independently:
 | Qwen Image 2.1 | `qwenimage_worker.py` | `qwen-image` | Generated PNG |
 | ControlNet (SD 1.5 + depth) | `controlnet_worker.py` | `stable-diffusion-controlnet` | Generated PNG |
 | SDXL ControlNet (SDXL + depth) | `sdxl_worker.py` | `stable-diffusion-controlnet-sdxl` | Generated PNG |
+| Flux ControlNet (Flux + depth) | `flux_controlnet_worker.py` | `flux-controlnet-depth` | Generated PNG |
 | Ultralytics SAM3 | `sam3_worker.py` | `sam3` | Detection metadata and masks |
 | Ultralytics SAM2 | `sam2_worker.py` | `sam2` | Detection metadata and masks |
+
+### Flux depth ControlNet
+
+`flux_controlnet_worker.py` uses `black-forest-labs/FLUX.1-dev` with the XLabs
+depth adapter. The XLabs repository contains the raw
+`flux-depth-controlnet-v3.safetensors` adapter rather than a Diffusers
+`FluxControlNetModel` directory. The worker therefore expects `--controlnet`
+to point to a converted Diffusers directory:
+
+```bash
+python3 flux_controlnet_worker.py \
+	--model black-forest-labs/FLUX.1-dev \
+	--controlnet /opt/models/flux-depth-controlnet-v3-diffusers \
+	--queue flux-controlnet-depth \
+	--rabbitmq-url amqp://guest:guest@HOST:5672/%2F
+```
+
+The raw XLabs checkpoint cannot be passed directly to Diffusers 0.40.0 because
+that version has no single-file loader for `FluxControlNetModel`.
 
 ## RabbitMQ message format
 

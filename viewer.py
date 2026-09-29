@@ -28,20 +28,19 @@ CAMERA_NEAR_RATIO = 0.005
 CAMERA_FAR_RATIO = 20.0
 CONTROLNET_QUEUE = "stable-diffusion-controlnet"
 SDXL_CONTROLNET_QUEUE = "stable-diffusion-controlnet-sdxl"
-# Phase 4 prompts from the SDXL texture-enhancement plan: favor sharp,
-# photogrammetry-style detail and discourage painterly/inconsistent output.
+# SDXL prompt: favor crisp architectural materials while preserving the captured
+# camera view and depth geometry.
 SDXL_PROMPT = (
-	"high resolution aerial photogrammetry texture, realistic building materials, "
-	"detailed rooftops, clean facade textures, sharp roads, realistic vegetation, "
-	"survey grade reconstruction, high frequency detail, consistent lighting"
+	"photorealistic aerial 3D town reconstruction, finely detailed roof tiles and facade materials, "
+	"crisp architectural edges, detailed windows and vegetation, accurate roads and building layout, "
+	"sharp focus, natural daylight, high quality"
 )
 SDXL_NEGATIVE_PROMPT = (
 	"cartoon, illustration, painting, watermark, logo, text, duplicate buildings, "
 	"warped geometry, distorted structures, deformed roofs, blurry, low quality"
 )
-# Phase 3: a lower denoising strength preserves mesh geometry and reduces
-# reprojection seams compared to the SD 1.5 ControlNet default.
-SDXL_STRENGTH = 0.18
+# Moderate denoising improves texture detail while retaining the captured view.
+SDXL_STRENGTH = 0.45
 RABBITMQ_URL = os.getenv(
 	"RABBITMQ_URL", "amqp://guest:guest@localhost:5672/%2F"
 )
@@ -290,10 +289,10 @@ class ModelWindow(pyglet.window.Window):
 		request = {
 			"prompt": SDXL_PROMPT,
 			"negative_prompt": SDXL_NEGATIVE_PROMPT,
-			"steps": 30,
+			"steps": 40,
 			"strength": SDXL_STRENGTH,
-			"guidance_scale": 5.5,
-			"controlnet_conditioning_scale": 1.25,
+			"guidance_scale": 6.0,
+			"controlnet_conditioning_scale": 1.0,
 			"seed": 0,
 		}
 		self._request_controlnet_worker(
@@ -418,7 +417,7 @@ class ModelWindow(pyglet.window.Window):
 		elif self.orbit_button == "zoom" and not self.walk_mode:
 			self.distance *= math.exp(-dy * 0.01)
 			extent = self.render_scene._orbit_extent
-			self.distance = float(np.clip(self.distance, extent * 0.25, extent * 20.0))
+			self.distance = float(np.clip(self.distance, extent * 0.03, extent * 20.0))
 			self.update_camera()
 
 	def on_mouse_motion(self, _x: int, _y: int, dx: int, dy: int) -> None:
@@ -577,7 +576,7 @@ class ModelWindow(pyglet.window.Window):
 		if np.linalg.norm(movement) > 0:
 			movement /= np.linalg.norm(movement)
 			current_ground_y = self.lowest_triangle_y(pose[0, 3], pose[2, 3])
-			next_position = pose[:3, 3] + movement * float(self.render_scene._orbit_extent) * 0.12 * delta_time
+			next_position = pose[:3, 3] + movement * float(self.render_scene._orbit_extent) * 0.06 * delta_time
 			next_ground_y = self.lowest_triangle_y(next_position[0], next_position[2])
 			step_up = (
 				next_ground_y - current_ground_y
@@ -619,7 +618,7 @@ class ModelWindow(pyglet.window.Window):
 			return
 		self.distance *= 0.88 ** scroll_y
 		extent = self.render_scene._orbit_extent
-		self.distance = float(np.clip(self.distance, extent * 0.25, extent * 20.0))
+		self.distance = float(np.clip(self.distance, extent * 0.03, extent * 20.0))
 		self.update_camera()
 
 	def pan_orbit(self, dx: int, dy: int) -> None:
