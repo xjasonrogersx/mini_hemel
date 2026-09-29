@@ -138,13 +138,13 @@ def main() -> None:
     script_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--image", type=Path, default=script_dir / "test/stormtrooper.png"
+        "--image", type=Path, default=script_dir / "test/view_controlnet_20260928_205344_605312.png"
     )
     parser.add_argument(
-        "--depth", type=Path, default=script_dir / "test/stormtrooper_depth.png"
+        "--depth", type=Path, default=script_dir / "test/depth_20260928_205327_600485.png"
     )
     parser.add_argument(
-        "--output", type=Path, default=script_dir / "test/stormtrooper_sdxl.png"
+        "--output", type=Path, default=script_dir / "test/result.png"
     )
     parser.add_argument(
         "--rabbitmq-url",
