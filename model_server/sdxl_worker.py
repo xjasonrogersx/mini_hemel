@@ -58,7 +58,7 @@ class SDXLWorker:
         )
         # Phase 2: memory optimizations to fit an 8GB GPU such as an RTX 3060 Ti.
         if dtype == torch.float16:
-            self.pipeline.enable_model_cpu_offload()
+            self.pipeline.enable_sequential_cpu_offload()
         else:
             self.pipeline.to("cpu")
         self.pipeline.enable_attention_slicing()
@@ -106,7 +106,7 @@ class SDXLWorker:
             pipeline_kwargs = {
                 "prompt": prompt,
                 "negative_prompt": negative_prompt,
-                "num_inference_steps": requested_iterations,
+                "num_inference_steps": iterations,
                 "guidance_scale": float(request.get("guidance_scale", 5.5)),
                 "controlnet_conditioning_scale": float(
                     request.get("controlnet_conditioning_scale", 1.0)
