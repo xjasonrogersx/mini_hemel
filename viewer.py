@@ -27,6 +27,21 @@ CAPTURES_PATH = Path(__file__).with_name("captures")
 CAMERA_NEAR_RATIO = 0.005
 CAMERA_FAR_RATIO = 20.0
 CONTROLNET_QUEUE = "stable-diffusion-controlnet"
+SDXL_CONTROLNET_QUEUE = "stable-diffusion-controlnet-sdxl"
+# Phase 4 prompts from the SDXL texture-enhancement plan: favor sharp,
+# photogrammetry-style detail and discourage painterly/inconsistent output.
+SDXL_PROMPT = (
+	"high resolution aerial photogrammetry texture, realistic building materials, "
+	"detailed rooftops, clean facade textures, sharp roads, realistic vegetation, "
+	"survey grade reconstruction, high frequency detail, consistent lighting"
+)
+SDXL_NEGATIVE_PROMPT = (
+	"cartoon, illustration, painting, watermark, logo, text, duplicate buildings, "
+	"warped geometry, distorted structures, deformed roofs, blurry, low quality"
+)
+# Phase 3: a lower denoising strength preserves mesh geometry and reduces
+# reprojection seams compared to the SD 1.5 ControlNet default.
+SDXL_STRENGTH = 0.18
 RABBITMQ_URL = os.getenv(
 	"RABBITMQ_URL", "amqp://guest:guest@localhost:5672/%2F"
 )
@@ -152,6 +167,9 @@ class ModelWindow(pyglet.window.Window):
 		if symbol == pyglet.window.key.Q:
 			self.generate_controlnet_view()
 			return
+		if symbol == pyglet.window.key.W:
+			self.generate_sdxl_view()
+			return
 		if symbol == pyglet.window.key.F:
 			self.set_fullscreen(not self.fullscreen)
 			self.set_exclusive_mouse(self.fullscreen and self.walk_mode)
@@ -211,6 +229,20 @@ class ModelWindow(pyglet.window.Window):
 			name="controlnet-request",
 		).start()
 
+	def generate_sdxl_view(self) -> None:
+		try:
+			view_path, depth_path = self.save_current_view_files()
+		except Exception as exc:
+			self.set_caption(f"SDXL capture failed: {exc}")
+			return
+		self.set_caption("Sending RGB/depth view to SDXL...")
+		threading.Thread(
+			target=self._request_sdxl,
+			args=(view_path, depth_path),
+			daemon=True,
+			name="sdxl-request",
+		).start()
+
 	def save_current_view_files(self) -> tuple[Path, Path]:
 		CAPTURES_PATH.mkdir(parents=True, exist_ok=True)
 		stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -241,6 +273,36 @@ class ModelWindow(pyglet.window.Window):
 		return view_path, depth_path
 
 	def _request_controlnet(self, view_path: Path, depth_path: Path) -> None:
+		request = {
+			"prompt": "photorealistic textured reconstruction, natural materials, realistic lighting, preserve exact geometry and composition",
+			"negative_prompt": "changed camera angle, changed geometry, warped structures, extra objects, text, watermark, blur",
+			"steps": 30,
+			"strength": 0.20,
+			"guidance_scale": 5.5,
+			"controlnet_conditioning_scale": 1.25,
+			"seed": 0,
+		}
+		self._request_controlnet_worker(
+			view_path, depth_path, queue=CONTROLNET_QUEUE, worker_label="ControlNet", request=request
+		)
+
+	def _request_sdxl(self, view_path: Path, depth_path: Path) -> None:
+		request = {
+			"prompt": SDXL_PROMPT,
+			"negative_prompt": SDXL_NEGATIVE_PROMPT,
+			"steps": 30,
+			"strength": SDXL_STRENGTH,
+			"guidance_scale": 5.5,
+			"controlnet_conditioning_scale": 1.25,
+			"seed": 0,
+		}
+		self._request_controlnet_worker(
+			view_path, depth_path, queue=SDXL_CONTROLNET_QUEUE, worker_label="SDXL", request=request
+		)
+
+	def _request_controlnet_worker(
+		self, view_path: Path, depth_path: Path, *, queue: str, worker_label: str, request: dict
+	) -> None:
 		try:
 			import pika
 			def encode(path: Path) -> str:
@@ -248,16 +310,11 @@ class ModelWindow(pyglet.window.Window):
 			request = {
 				"image_base64": encode(view_path),
 				"control_image_base64": encode(depth_path),
-				"prompt": "photorealistic textured reconstruction, natural materials, realistic lighting, preserve exact geometry and composition",
-				"negative_prompt": "changed camera angle, changed geometry, warped structures, extra objects, text, watermark, blur",
-				"steps": 30,
-				"strength": 0.20,
-				"guidance_scale": 5.5,
-				"controlnet_conditioning_scale": 1.25,
-				"seed": 0,
+				**request,
 			}
 			LOGGER.info(
-				"Sending ControlNet request steps=%d strength=%.2f guidance=%.2f control_scale=%.2f",
+				"Sending %s request steps=%d strength=%.2f guidance=%.2f control_scale=%.2f",
+				worker_label,
 				request["steps"],
 				request["strength"],
 				request["guidance_scale"],
@@ -268,7 +325,7 @@ class ModelWindow(pyglet.window.Window):
 			parameters.heartbeat = 0
 			connection = pika.BlockingConnection(parameters)
 			channel = connection.channel()
-			channel.queue_declare(queue=CONTROLNET_QUEUE, durable=True)
+			channel.queue_declare(queue=queue, durable=True)
 			reply_queue = channel.queue_declare(queue="", exclusive=True).method.queue
 			response: bytes | None = None
 			def on_response(_channel, _method, properties, body: bytes) -> None:
@@ -277,7 +334,7 @@ class ModelWindow(pyglet.window.Window):
 					response = body
 			consumer_tag = channel.basic_consume(queue=reply_queue, on_message_callback=on_response, auto_ack=True)
 			channel.basic_publish(
-				exchange="", routing_key=CONTROLNET_QUEUE, body=json.dumps(request).encode("utf-8"),
+				exchange="", routing_key=queue, body=json.dumps(request).encode("utf-8"),
 				properties=pika.BasicProperties(content_type="application/json", correlation_id=correlation_id, reply_to=reply_queue),
 			)
 			while response is None:
@@ -286,11 +343,15 @@ class ModelWindow(pyglet.window.Window):
 			connection.close()
 			result = json.loads(response.decode("utf-8"))
 			if not result.get("ok"):
-				raise RuntimeError(result.get("error", "ControlNet worker failed"))
-			output_path = CAPTURES_PATH / f"view_controlnet_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+				raise RuntimeError(result.get("error", f"{worker_label} worker failed"))
+			output_path = (
+				CAPTURES_PATH
+				/ f"view_{worker_label.lower()}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+			)
 			output_path.write_bytes(base64.b64decode(result["image_base64"]))
 			LOGGER.info(
-				"ControlNet response received iterations=%s/%s duration=%ss output=%s",
+				"%s response received iterations=%s/%s duration=%ss output=%s",
+				worker_label,
 				result.get("iterations", "?"),
 				result.get("requested_iterations", "?"),
 				result.get("duration_seconds", "?"),
@@ -300,11 +361,11 @@ class ModelWindow(pyglet.window.Window):
 			requested_iterations = result.get("requested_iterations", request["steps"])
 			duration = result.get("duration_seconds")
 			self.set_caption(
-				f"ControlNet render saved: {output_path.name} | "
+				f"{worker_label} render saved: {output_path.name} | "
 				f"iterations: {iterations}/{requested_iterations} | duration: {duration}s"
 			)
 		except Exception as exc:
-			self.set_caption(f"ControlNet request failed: {exc}")
+			self.set_caption(f"{worker_label} request failed: {exc}")
 
 	def on_key_release(self, symbol: int, _modifiers: int) -> None:
 		self.walk_keys.discard(symbol)
