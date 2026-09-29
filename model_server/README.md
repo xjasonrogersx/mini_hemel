@@ -10,6 +10,8 @@ The workers use separate queues so they can run independently:
 | Stable Diffusion | `diffusion_worker.py` | `stable-diffusion` | Generated PNG |
 | Stable Diffusion 1.5 | `d1.5_worker.py` | `stable-diffusion-15` | Generated PNG |
 | Qwen Image 2.1 | `qwenimage_worker.py` | `qwen-image` | Generated PNG |
+| ControlNet (SD 1.5 + depth) | `controlnet_worker.py` | `stable-diffusion-controlnet` | Generated PNG |
+| SDXL ControlNet (SDXL + depth) | `sdxl_worker.py` | `stable-diffusion-controlnet-sdxl` | Generated PNG |
 | Ultralytics SAM3 | `sam3_worker.py` | `sam3` | Detection metadata and masks |
 | Ultralytics SAM2 | `sam2_worker.py` | `sam2` | Detection metadata and masks |
 
@@ -296,6 +298,52 @@ used as the generation source:
 ```bash
 RABBITMQ_URL=amqp://guest:guest@192.168.1.252:5672/%2F \
 python3 controlnet_test.py
+```
+
+Use `--mode img2img` to start from the RGB input instead. The worker must be
+restarted after changing its code.
+
+### SDXL ControlNet worker
+
+The viewer's `W` key uses the `stable-diffusion-controlnet-sdxl` queue. This
+worker upgrades the ControlNet worker above to
+`stabilityai/stable-diffusion-xl-base-1.0` with
+`diffusers/controlnet-depth-sdxl-1.0`, uses a lower default denoising
+strength (`0.18`) to better preserve mesh geometry, and enables additional
+memory optimizations (`enable_model_cpu_offload`, `enable_attention_slicing`,
+`enable_vae_slicing`, `enable_vae_tiling`) to fit GPUs with as little as 8GB
+of VRAM, such as an RTX 3060 Ti. Install the same additional worker packages
+used by the ControlNet worker:
+
+```bash
+source .venv/bin/activate
+python3 -m pip install diffusers accelerate torchvision
+```
+
+Start the worker:
+
+```bash
+python3 sdxl_worker.py \
+	--rabbitmq-url ******172.17.0.1:5672/%2F \
+	--queue stable-diffusion-controlnet-sdxl
+```
+
+The worker prints:
+
+```text
+Waiting for SDXL requests on stable-diffusion-controlnet-sdxl
+```
+
+Press `W` after the worker reports that it is waiting for requests. The
+generated image is saved in `captures/` as `view_sdxl_<timestamp>.png`. The
+response format is identical to the ControlNet worker's response shown above.
+
+Use the standalone test client to compare the worker directly through
+RabbitMQ, without going through the viewer:
+
+```bash
+RABBITMQ_URL=******192.168.1.252:5672/%2F \
+python3 sdxl_test.py
 ```
 
 Use `--mode img2img` to start from the RGB input instead. The worker must be

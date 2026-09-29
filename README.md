@@ -88,6 +88,18 @@ python3 viewer.py
 
 The generated image is saved in `captures/` as `view_controlnet_<timestamp>.png`.
 
+## SDXL textured renders
 
+Press `W` in the viewer to save the current RGB/depth pair and generate a
+higher quality textured render with SDXL and the SDXL depth ControlNet. This
+worker uses a lower denoising strength (0.18) to better preserve mesh
+geometry. Start RabbitMQ and the worker before launching the viewer:
 
+```bash
+python3 model_server/sdxl_worker.py \
+  --model stabilityai/stable-diffusion-xl-base-1.0 \
+  --controlnet diffusers/controlnet-depth-sdxl-1.0
+python3 viewer.py
+```
 
+The generated image is saved in `captures/` as `view_sdxl_<timestamp>.png`.
