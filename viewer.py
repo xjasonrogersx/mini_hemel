@@ -15,6 +15,8 @@ import uuid
 import numpy as np
 import pyglet
 from pyglet import gl
+from pyglet import shapes
+from pyglet.text import Label
 import pyrender
 import trimesh
 from PIL import Image
@@ -28,6 +30,7 @@ CAMERA_NEAR_RATIO = 0.005
 CAMERA_FAR_RATIO = 20.0
 CONTROLNET_QUEUE = "stable-diffusion-controlnet"
 SDXL_CONTROLNET_QUEUE = "stable-diffusion-controlnet-sdxl"
+FLUX_CONTROLNET_QUEUE = "flux-controlnet-depth"
 # SDXL prompt: favor crisp architectural materials while preserving the captured
 # camera view and depth geometry.
 SDXL_PROMPT = (
@@ -102,6 +105,13 @@ class ModelWindow(pyglet.window.Window):
 		self.walk_look_drag = False
 		self.walk_height = 0.0
 		self.last_click: tuple[float, int, int] | None = None
+		self.worker_menu: tuple[int, int] | None = None
+		self.worker_menu_items = (
+			("SD 1.5 ControlNet", "controlnet"),
+			("SDXL ControlNet", "sdxl"),
+			("Flux depth ControlNet", "flux"),
+			("Cancel", "cancel"),
+		)
 		self.color_buffer = np.zeros((WINDOW_HEIGHT, WINDOW_WIDTH, 4), dtype=np.uint8)
 		self.update_camera()
 		pyglet.clock.schedule_interval(self.render_frame, 1.0 / 60.0)
@@ -152,6 +162,33 @@ class ModelWindow(pyglet.window.Window):
 			pitch=-self.width * 4,
 		)
 		image.blit(0, 0, width=self.width, height=self.height)
+		if self.worker_menu is not None:
+			self.draw_worker_menu()
+
+	def draw_worker_menu(self) -> None:
+		x, y = self.worker_menu
+		item_height = 34
+		menu_width = 230
+		menu_height = item_height * len(self.worker_menu_items)
+		menu_x = min(max(x, 8), max(8, self.width - menu_width - 8))
+		menu_y = min(max(y - menu_height, 8), max(8, self.height - menu_height - 8))
+		shapes.Rectangle(
+			menu_x, menu_y, menu_width, menu_height, color=(24, 30, 42)
+		).draw()
+		for index, (label, _worker) in enumerate(self.worker_menu_items):
+			item_y = menu_y + menu_height - (index + 1) * item_height
+			shapes.Rectangle(
+				menu_x + 2, item_y + 2, menu_width - 4, item_height - 4,
+				color=(42, 52, 70),
+			).draw()
+			Label(
+				label,
+				x=menu_x + 14,
+				y=item_y + 9,
+				font_name="Arial",
+				font_size=13,
+				color=(235, 240, 248, 255),
+			).draw()
 
 	def on_resize(self, width: int, height: int) -> None:
 		self.camera.aspectRatio = width / max(height, 1)
@@ -160,13 +197,13 @@ class ModelWindow(pyglet.window.Window):
 		self.color_buffer = np.zeros((height, width, 4), dtype=np.uint8)
 
 	def on_key_press(self, symbol: int, _modifiers: int) -> None:
+		if symbol == pyglet.window.key.Q:
+			self.close()
+			return
 		if symbol == pyglet.window.key.S:
 			self.save_current_view()
 			return
-		if symbol == pyglet.window.key.Q:
-			self.generate_controlnet_view()
-			return
-		if symbol == pyglet.window.key.W:
+		if symbol == pyglet.window.key.R and not self.walk_mode:
 			self.generate_sdxl_view()
 			return
 		if symbol == pyglet.window.key.F:
@@ -242,6 +279,20 @@ class ModelWindow(pyglet.window.Window):
 			name="sdxl-request",
 		).start()
 
+	def generate_flux_view(self) -> None:
+		try:
+			view_path, depth_path = self.save_current_view_files()
+		except Exception as exc:
+			self.set_caption(f"Flux capture failed: {exc}")
+			return
+		self.set_caption("Sending RGB/depth view to Flux...")
+		threading.Thread(
+			target=self._request_flux,
+			args=(view_path, depth_path),
+			daemon=True,
+			name="flux-request",
+		).start()
+
 	def save_current_view_files(self) -> tuple[Path, Path]:
 		CAPTURES_PATH.mkdir(parents=True, exist_ok=True)
 		stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -297,6 +348,21 @@ class ModelWindow(pyglet.window.Window):
 		}
 		self._request_controlnet_worker(
 			view_path, depth_path, queue=SDXL_CONTROLNET_QUEUE, worker_label="SDXL", request=request
+		)
+
+	def _request_flux(self, view_path: Path, depth_path: Path) -> None:
+		request = {
+			"mode": "img2img",
+			"prompt": SDXL_PROMPT,
+			"negative_prompt": SDXL_NEGATIVE_PROMPT,
+			"steps": 25,
+			"strength": 0.35,
+			"guidance_scale": 3.5,
+			"controlnet_conditioning_scale": 1.0,
+			"seed": 0,
+		}
+		self._request_controlnet_worker(
+			view_path, depth_path, queue=FLUX_CONTROLNET_QUEUE, worker_label="Flux", request=request
 		)
 
 	def _request_controlnet_worker(
@@ -374,16 +440,8 @@ class ModelWindow(pyglet.window.Window):
 			if self.walk_mode:
 				self.walk_look_drag = not self.fullscreen
 				return
-			now = time.monotonic()
-			previous = self.last_click
-			self.last_click = (now, x, y)
-			if (
-				not self.walk_mode
-				and previous is not None
-				and now - previous[0] <= 0.35
-				and (x - previous[1]) ** 2 + (y - previous[2]) ** 2 <= 64
-			):
-				self.enter_walk_mode(x, y)
+			if self.worker_menu is not None:
+				self.select_worker_menu(x, y)
 				return
 			self.orbit_button = "orbit" if modifiers & pyglet.window.key.MOD_SHIFT else "pan"
 		elif button == pyglet.window.mouse.MIDDLE:
@@ -391,7 +449,32 @@ class ModelWindow(pyglet.window.Window):
 				return
 			self.orbit_button = "orbit"
 		elif button == pyglet.window.mouse.RIGHT:
-			self.orbit_button = "zoom"
+			if not self.walk_mode:
+				self.worker_menu = (x, y)
+				self.set_caption("Select a worker for the new texture render")
+
+	def select_worker_menu(self, x: int, y: int) -> None:
+		menu_x, menu_y = self.worker_menu
+		item_height = 34
+		menu_width = 230
+		menu_height = item_height * len(self.worker_menu_items)
+		menu_x = min(max(menu_x, 8), max(8, self.width - menu_width - 8))
+		menu_y = min(max(menu_y - menu_height, 8), max(8, self.height - menu_height - 8))
+		if not (menu_x <= x <= menu_x + menu_width and menu_y <= y <= menu_y + menu_height):
+			self.worker_menu = None
+			return
+		index = int((y - menu_y) // item_height)
+		if index < 0 or index >= len(self.worker_menu_items):
+			self.worker_menu = None
+			return
+		_worker = self.worker_menu_items[len(self.worker_menu_items) - 1 - index][1]
+		self.worker_menu = None
+		if _worker == "controlnet":
+			self.generate_controlnet_view()
+		elif _worker == "sdxl":
+			self.generate_sdxl_view()
+		elif _worker == "flux":
+			self.generate_flux_view()
 
 	def on_mouse_release(self, _x: int, _y: int, button: int, _modifiers: int) -> None:
 		if button == pyglet.window.mouse.MIDDLE and self.walk_mode:

@@ -296,8 +296,8 @@ RABBITMQ_URL=amqp://guest:guest@172.17.0.1:5672/%2F python3 ../viewer.py
 ```
 
 Alternatively, run the worker and viewer on the same host as RabbitMQ and use
-the default `localhost` URL. Press `Q` after the worker reports that it is
-waiting for requests. The generated image is saved in `captures/`. The worker
+the default `localhost` URL. Right-click in the viewer and choose ControlNet
+after the worker reports that it is waiting for requests. The generated image is saved in `captures/`. The worker
 logs the device, request settings, input modes, effective/requested iterations,
 and inference duration. A successful response includes the same metadata:
 
@@ -325,7 +325,8 @@ restarted after changing its code.
 
 ### SDXL ControlNet worker
 
-The viewer's `W` key uses the `stable-diffusion-controlnet-sdxl` queue. This
+The viewer's `R` key, or the SDXL option in the left-click worker picker, uses
+the `stable-diffusion-controlnet-sdxl` queue. This
 worker upgrades the ControlNet worker above to
 `stabilityai/stable-diffusion-xl-base-1.0` with
 `diffusers/controlnet-depth-sdxl-1.0`, uses a lower default denoising
@@ -354,7 +355,7 @@ The worker prints:
 Waiting for SDXL requests on stable-diffusion-controlnet-sdxl
 ```
 
-Press `W` after the worker reports that it is waiting for requests. The
+Press `R` after the worker reports that it is waiting for requests. The
 generated image is saved in `captures/` as `view_sdxl_<timestamp>.png`. The
 response format is identical to the ControlNet worker's response shown above.
 

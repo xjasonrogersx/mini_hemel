@@ -33,6 +33,34 @@ pip install --upgrade --force-reinstall \
  'PyOpenGL>=3.1.10' 'PyOpenGL_accelerate>=3.1.10'
  ```
 
+
+
+![alt text](images/image.png)
+
+## Streat level
+
+![alt text](images/street_level.pngimage.png)
+
+
+![alt text](images/view1.png)
+![alt text](images/view1-improved.png)
+![alt text](images/view1-with-context.png)
+
+
+
+## Geomenty form imags
+
+https://huggingface.co/spaces/microsoft/TRELLIS.2
+
+
+## 
+
+RabbitMQ is a good fit for this asynchronous, potentially slow GPU job. For
+large images or many concurrent clients, store images in object storage and
+send only an object key through RabbitMQ; base64-encoded PNG messages are kept
+here because the current viewer sends one screenshot at a time.
+
+
 ## Orbit mode navigation
 
 The viewer currently uses **Google Earth-style orbit controls**.
@@ -40,8 +68,8 @@ The viewer currently uses **Google Earth-style orbit controls**.
 | Action | Control |
 | --- | --- |
 | Orbit / tilt | Shift + left mouse button drag |
-| Pan | Left mouse button drag |
-| Zoom | Scroll wheel (or right mouse button drag up/down) |
+| New texture render | Right click, then choose a worker |
+| Zoom | Scroll wheel |
 
 ### Comparison matrix
 
@@ -51,8 +79,8 @@ The viewer currently uses **Google Earth-style orbit controls**.
 | Pan | Shift + middle mouse button drag | Shift + middle mouse button drag | Left mouse button drag |
 | Zoom | Scroll wheel | Scroll wheel | Scroll wheel (or right mouse button drag up/down) |
 
-Double-click the scene to enter walk mode. Press `G` to return to orbit mode
-and `F` to toggle fullscreen.
+Press `G` to return to orbit mode and `F` to toggle fullscreen. Press `Q` to
+quit the viewer.
 
 ## Walk mode navigation
 
@@ -73,11 +101,13 @@ Walk mode uses basic Quake-style movement controls:
 
 The window title shows the current walk height in metres.
 
-## ControlNet textured renders
+## Texture worker picker
 
-Press `Q` in the viewer to save the current RGB/depth pair and generate a
-photorealistic textured render with Stable Diffusion and the depth ControlNet.
-Start RabbitMQ and the worker before launching the viewer:
+Right-click in orbit mode and choose Stable Diffusion 1.5 ControlNet, SDXL
+ControlNet, or Flux depth ControlNet. The viewer saves the current RGB/depth
+pair and sends it to the selected RabbitMQ worker.
+
+For the Stable Diffusion 1.5 worker:
 
 ```bash
 python3 model_server/controlnet_worker.py \
@@ -90,10 +120,10 @@ The generated image is saved in `captures/` as `view_controlnet_<timestamp>.png`
 
 ## SDXL textured renders
 
-Press `W` in the viewer to save the current RGB/depth pair and generate a
-higher quality textured render with SDXL and the SDXL depth ControlNet. This
-worker uses a lower denoising strength (0.18) to better preserve mesh
-geometry. Start RabbitMQ and the worker before launching the viewer:
+Press `R` in the viewer for a direct SDXL render, or choose SDXL from the
+worker picker. This generates a higher quality textured render with SDXL and
+the SDXL depth ControlNet. Start RabbitMQ and the worker before launching the
+viewer:
 
 ```bash
 python3 model_server/sdxl_worker.py \
