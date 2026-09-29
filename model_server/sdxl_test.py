@@ -19,9 +19,9 @@ from PIL import Image
 DEFAULT_RABBITMQ_URL = "amqp://guest:guest@192.168.1.252:5672/%2F"
 DEFAULT_QUEUE = "stable-diffusion-controlnet-sdxl"
 DEFAULT_PROMPT = (
-    "photorealistic aerial 3D town reconstruction, realistic roof and facade materials, "
-    "crisp architectural details, natural vegetation, accurate roads and building layout, "
-    "sharp focus, consistent daylight, high quality"
+    "photorealistic aerial 3D town reconstruction, finely detailed roof tiles and facade materials, "
+    "crisp architectural edges, detailed windows and vegetation, accurate roads and building layout, "
+    "sharp focus, natural daylight, high quality"
 )
 DEFAULT_NEGATIVE_PROMPT = (
     "cartoon, illustration, painting, watermark, logo, text, duplicate buildings, "
@@ -154,9 +154,9 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--negative-prompt", default=DEFAULT_NEGATIVE_PROMPT)
-    parser.add_argument("--steps", type=int, default=30)
-    parser.add_argument("--strength", type=float, default=0.30)
-    parser.add_argument("--guidance-scale", type=float, default=5.0)
+    parser.add_argument("--steps", type=int, default=40)
+    parser.add_argument("--strength", type=float, default=0.45)
+    parser.add_argument("--guidance-scale", type=float, default=6.0)
     parser.add_argument("--controlnet-conditioning-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(

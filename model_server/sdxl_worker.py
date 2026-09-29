@@ -27,7 +27,7 @@ from diffusers import (
     StableDiffusionXLControlNetImg2ImgPipeline,
     StableDiffusionXLControlNetPipeline,
 )
-from PIL import Image
+from PIL import Image, ImageFilter
 
 
 LOGGER = logging.getLogger(__name__)
@@ -132,6 +132,7 @@ class SDXLWorker:
                 ).images[0]
             else:
                 raise ValueError(f"unsupported SDXL mode: {mode}")
+        result = result.filter(ImageFilter.UnsharpMask(radius=1.2, percent=145, threshold=3))
         output = io.BytesIO()
         result.save(output, format="PNG")
         duration = time.monotonic() - started_at
