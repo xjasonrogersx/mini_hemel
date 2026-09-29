@@ -62,8 +62,10 @@ class SDXLWorker:
         else:
             self.pipeline.to("cpu")
         self.pipeline.enable_attention_slicing()
-        self.pipeline.enable_vae_slicing()
-        self.pipeline.enable_vae_tiling()
+        if hasattr(self.pipeline, "enable_vae_slicing"):
+            self.pipeline.enable_vae_slicing()
+        if hasattr(self.pipeline, "enable_vae_tiling"):
+            self.pipeline.enable_vae_tiling()
         self.queue = args.queue
         self.rabbitmq_url = args.rabbitmq_url
         self.text_pipeline: StableDiffusionXLControlNetPipeline | None = None
