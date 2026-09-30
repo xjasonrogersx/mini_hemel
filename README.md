@@ -133,3 +133,11 @@ python3 viewer.py
 ```
 
 The generated image is saved in `captures/` as `view_sdxl_<timestamp>.png`.
+
+## Configured texture render
+
+Press `T` to read `config.json` and use the configured texture generator. For
+`runpod_nano_banana_2`, the viewer captures matching 4:3 RGB and depth images,
+uploads them temporarily to the configured Cloudflare R2 bucket, calls the
+RunPod edit endpoint, downloads the result to `captures/`, and deletes the
+temporary bucket objects. The R2 public base URL must be reachable by RunPod.

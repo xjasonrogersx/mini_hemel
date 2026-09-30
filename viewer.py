@@ -3,11 +3,13 @@
 from pathlib import Path
 from datetime import datetime
 import base64
+import boto3
 import io
 import json
 import logging
 import math
 import os
+import requests
 import threading
 import time
 import uuid
@@ -19,7 +21,8 @@ from pyglet import shapes
 from pyglet.text import Label
 import pyrender
 import trimesh
-from PIL import Image
+from botocore.config import Config
+from PIL import Image, ImageOps
 
 
 ASSET_PATH = Path(__file__).with_name("merged.gltf")
@@ -31,6 +34,12 @@ CAMERA_FAR_RATIO = 20.0
 CONTROLNET_QUEUE = "stable-diffusion-controlnet"
 SDXL_CONTROLNET_QUEUE = "stable-diffusion-controlnet-sdxl"
 FLUX_CONTROLNET_QUEUE = "flux-controlnet-depth"
+CONFIG_PATH = Path(__file__).with_name("config.json")
+R2_PUBLIC_BASE_URL = os.getenv(
+	"R2_PUBLIC_BASE_URL", "https://pub-e615b9910ad849b2a11f2ca22ba7869b.r2.dev"
+).rstrip("/")
+ARTIFACTS_PATH = Path(__file__).with_name("artifacts.json")
+ARTIFACTS_LOCK = threading.Lock()
 # SDXL prompt: favor crisp architectural materials while preserving the captured
 # camera view and depth geometry.
 SDXL_PROMPT = (
@@ -206,6 +215,10 @@ class ModelWindow(pyglet.window.Window):
 		if symbol == pyglet.window.key.R and not self.walk_mode:
 			self.generate_sdxl_view()
 			return
+		if symbol == pyglet.window.key.T and not self.walk_mode:
+			LOGGER.info("T pressed: starting configured texture generation")
+			self.generate_configured_texture_view()
+			return
 		if symbol == pyglet.window.key.F:
 			self.set_fullscreen(not self.fullscreen)
 			self.set_exclusive_mouse(self.fullscreen and self.walk_mode)
@@ -292,6 +305,251 @@ class ModelWindow(pyglet.window.Window):
 			daemon=True,
 			name="flux-request",
 		).start()
+
+	def generate_configured_texture_view(self) -> None:
+		try:
+			texture_config = self.load_texture_config()
+			LOGGER.info(
+				"Configured texture settings: model=%s resolution=%s aspect_ratio=%s prompt=%s",
+				texture_config.get("model"),
+				texture_config.get("resolution"),
+				texture_config.get("aspect_ratio"),
+				texture_config.get("prompt"),
+			)
+			view_path, depth_path, camera_pose = self.save_texture_view_files(
+				texture_config.get("aspect_ratio", "4:3")
+			)
+			LOGGER.info(
+				"Configured texture captures ready: rgb=%s (%d bytes) depth=%s (%d bytes)",
+				view_path,
+				view_path.stat().st_size,
+				depth_path,
+				depth_path.stat().st_size,
+			)
+		except Exception as exc:
+			self.set_caption(f"Configured texture capture failed: {exc}")
+			return
+		self.set_caption(
+			f"Sending {texture_config.get('model', 'configured')} texture request..."
+		)
+		threading.Thread(
+			target=self._request_configured_texture,
+			args=(view_path, depth_path, camera_pose, texture_config),
+			daemon=True,
+			name="configured-texture-request",
+		).start()
+
+	@staticmethod
+	def load_texture_config() -> dict[str, str]:
+		with CONFIG_PATH.open(encoding="utf-8") as config_file:
+			config = json.load(config_file)
+		texture_config = config.get("texture_generator")
+		if not isinstance(texture_config, dict):
+			raise ValueError("config.json is missing texture_generator")
+		return texture_config
+
+	def save_texture_view_files(self, aspect_ratio: str) -> tuple[Path, Path, dict[str, object]]:
+		try:
+			aspect_width, aspect_height = (int(value) for value in aspect_ratio.split(":", 1))
+			if aspect_width <= 0 or aspect_height <= 0:
+				raise ValueError
+		except (ValueError, TypeError):
+			raise ValueError(f"invalid texture aspect ratio: {aspect_ratio}")
+		output_size = (1024, max(1, round(1024 * aspect_height / aspect_width)))
+		LOGGER.info(
+			"Rendering configured texture inputs: source=%dx%d target=%dx%d aspect=%s",
+			self.width,
+			self.height,
+			output_size[0],
+			output_size[1],
+			aspect_ratio,
+		)
+		CAPTURES_PATH.mkdir(parents=True, exist_ok=True)
+		stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+		view_path = CAPTURES_PATH / f"texture_view_{stamp}.png"
+		depth_path = CAPTURES_PATH / f"texture_depth_{stamp}.png"
+		color, depth = self.renderer.render(self.render_scene, flags=pyrender.RenderFlags.RGBA)
+		view_image = ImageOps.fit(
+			Image.fromarray(color[:, :, :3], mode="RGB"), output_size, method=Image.Resampling.LANCZOS
+		)
+		depth_image = ImageOps.fit(
+			Image.fromarray(depth, mode="F"), output_size, method=Image.Resampling.NEAREST
+		)
+		depth_array = np.asarray(depth_image, dtype=np.float32)
+		valid = np.isfinite(depth_array) & (depth_array > 0.0)
+		depth_output = np.zeros(depth_array.shape, dtype=np.uint16)
+		if valid.any():
+			nearest, farthest = np.percentile(depth_array[valid], [2.0, 98.0])
+			LOGGER.info(
+				"Configured depth capture: valid_pixels=%d/%d range=%.4f..%.4f",
+				int(valid.sum()),
+				valid.size,
+				float(nearest),
+				float(farthest),
+			)
+			if farthest > nearest:
+				depth_output[valid] = np.asarray(
+					(farthest - depth_array[valid]) / (farthest - nearest) * np.iinfo(np.uint16).max,
+					dtype=np.uint16,
+				)
+		view_image.save(view_path)
+		Image.fromarray(depth_output, mode="I;16").save(depth_path)
+		pose = self.render_scene.get_pose(self.render_scene._orbit_camera_node)
+		camera_pose = {
+			"matrix": pose.astype(float).tolist(),
+			"yaw": self.yaw,
+			"pitch": self.pitch,
+			"distance": self.distance,
+			"orbit_target": self.orbit_target.astype(float).tolist(),
+			"capture_size": {"width": output_size[0], "height": output_size[1]},
+		}
+		LOGGER.info("Configured camera pose captured: yaw=%.4f pitch=%.4f distance=%.4f", self.yaw, self.pitch, self.distance)
+		return view_path, depth_path, camera_pose
+
+	def _request_configured_texture(
+		self,
+		view_path: Path,
+		depth_path: Path,
+		camera_pose: dict[str, object],
+		texture_config: dict[str, str],
+	) -> None:
+		try:
+			model = texture_config.get("model")
+			LOGGER.info("Configured texture dispatch selected model=%s", model)
+			if model != "runpod_nano_banana_2":
+				raise ValueError(f"unsupported texture_generator.model: {model}")
+			output_path = self._request_runpod_nano_banana(
+				view_path, depth_path, texture_config
+			)
+			self.append_artifact(view_path, depth_path, output_path, camera_pose, texture_config)
+			LOGGER.info("Configured texture completed: output=%s bytes=%d", output_path, output_path.stat().st_size)
+			self.set_caption(f"Configured texture saved: {output_path.name}")
+		except Exception as exc:
+			LOGGER.exception("Configured texture request failed")
+			self.set_caption(f"Configured texture failed: {exc}")
+
+	@staticmethod
+	def _request_runpod_nano_banana(
+		view_path: Path, depth_path: Path, texture_config: dict[str, str]
+	) -> Path:
+		with CONFIG_PATH.open(encoding="utf-8") as config_file:
+			config = json.load(config_file)
+		r2_config = config["r2"]
+		s3 = boto3.client(
+			"s3",
+			endpoint_url=f"https://{r2_config['account_id']}.r2.cloudflarestorage.com",
+			aws_access_key_id=r2_config["access_key"],
+			aws_secret_access_key=r2_config["secret_key"],
+			region_name="auto",
+			config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+		)
+		stamp = uuid.uuid4().hex
+		keys = [f"images/texture-{stamp}-view.png", f"images/texture-{stamp}-depth.png"]
+		LOGGER.info(
+			"RunPod staging started: bucket=%s keys=%s endpoint=%s",
+			r2_config["bucket"],
+			keys,
+			f"https://{r2_config['account_id']}.r2.cloudflarestorage.com",
+		)
+		try:
+			for path, key in zip((view_path, depth_path), keys):
+				LOGGER.info("Uploading R2 object: local=%s key=%s bytes=%d", path, key, path.stat().st_size)
+				with path.open("rb") as image_file:
+					s3.upload_fileobj(
+						image_file,
+						r2_config["bucket"],
+						key,
+						ExtraArgs={"ContentType": "image/png"},
+					)
+				LOGGER.info("R2 upload complete: key=%s", key)
+			payload = {
+				"input": {
+					"images": [f"{R2_PUBLIC_BASE_URL}/{key}" for key in keys],
+					"prompt": texture_config.get("prompt", "improve texture quality and enhance details"),
+					"resolution": texture_config.get("resolution", "1k"),
+					"aspect_ratio": texture_config.get("aspect_ratio", "4:3"),
+					"output_format": "png",
+				}
+			}
+			LOGGER.info(
+				"Calling RunPod Nano Banana 2: endpoint=%s images=%d resolution=%s aspect_ratio=%s prompt=%s",
+				"google-nano-banana-2-edit/runsync",
+				len(payload["input"]["images"]),
+				payload["input"]["resolution"],
+				payload["input"]["aspect_ratio"],
+				payload["input"]["prompt"],
+			)
+			request_started = time.monotonic()
+			response = requests.post(
+				"https://api.runpod.ai/v2/google-nano-banana-2-edit/runsync",
+				headers={
+					"Authorization": f"Bearer {texture_config['key']}",
+					"Content-Type": "application/json",
+				},
+				json=payload,
+				timeout=300,
+			)
+			LOGGER.info(
+				"RunPod response received: status=%d duration=%.2fs",
+				response.status_code,
+				time.monotonic() - request_started,
+			)
+			response.raise_for_status()
+			data = response.json()
+			output_data = data.get("output", {})
+			image_url = output_data.get("image_url") or output_data.get("result")
+			if not image_url:
+				raise RuntimeError(f"RunPod response did not contain output image URL: {data}")
+			LOGGER.info("Downloading RunPod output image: url=%s", image_url)
+			image_response = requests.get(image_url, timeout=120)
+			image_response.raise_for_status()
+			output_path = CAPTURES_PATH / f"view_runpod_nano_banana_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+			output_path.write_bytes(image_response.content)
+			LOGGER.info("RunPod output saved: path=%s bytes=%d", output_path, len(image_response.content))
+			return output_path
+		finally:
+			for key in keys:
+				try:
+					LOGGER.info("Deleting temporary R2 object: key=%s", key)
+					s3.delete_object(Bucket=r2_config["bucket"], Key=key)
+					LOGGER.info("Temporary R2 object deleted: key=%s", key)
+				except Exception:
+					LOGGER.warning("Could not delete temporary R2 object %s", key, exc_info=True)
+
+	def append_artifact(
+		self,
+		view_path: Path,
+		depth_path: Path,
+		output_path: Path,
+		camera_pose: dict[str, object],
+		texture_config: dict[str, str],
+	) -> None:
+		try:
+			with ARTIFACTS_LOCK:
+				if ARTIFACTS_PATH.exists():
+					with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+						artifacts = json.load(artifacts_file)
+				else:
+					artifacts = []
+				if not isinstance(artifacts, list):
+					raise ValueError("artifacts.json must contain a JSON array")
+				artifact = {
+					"created_at": datetime.now().astimezone().isoformat(),
+					"generator": texture_config.get("model"),
+					"depth_render": depth_path.name,
+					"texture_render": view_path.name,
+					"result_render": output_path.name,
+					"camera_pose": camera_pose,
+				}
+				artifacts.append(artifact)
+				temporary_path = ARTIFACTS_PATH.with_suffix(".json.tmp")
+				with temporary_path.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+					artifacts_file.write("\n")
+				temporary_path.replace(ARTIFACTS_PATH)
+			LOGGER.info("Artifact recorded: file=%s result=%s", ARTIFACTS_PATH, output_path.name)
+		except Exception:
+			LOGGER.exception("Could not record texture artifact")
 
 	def save_current_view_files(self) -> tuple[Path, Path]:
 		CAPTURES_PATH.mkdir(parents=True, exist_ok=True)

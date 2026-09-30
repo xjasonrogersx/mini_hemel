@@ -64,3 +64,66 @@ Convert the viewer to a pyrender-based rendering flow while keeping the existing
 
 - The viewer is intended to run with a real desktop/X11 display so the window is visible to the user.
 - In a headless-only environment, rendering may continue without a visible GUI unless a desktop session or X11 forwarding is configured.
+
+
+--- 
+
+when I press "T"  read the config and decide  what texture gerneration is being used.
+I have set it to runpod_nano_banana_2 
+here is some info
+
+```
+import os
+import requests
+
+RUNPOD_API_KEY = os.environ["RUNPOD_API_KEY"]
+
+payload = {
+    "input": {
+        "images": [
+            "https://your-host.com/input1.png",
+            # cloudfare bucket public
+        ],
+        "prompt": get from config
+        "resolution": "1k",         get from config
+        "aspect_ratio":"4:3",       get from config
+        "output_format": "png",      
+        # "enable_base64_output": True,  # optional: return base64 instead of URL
+    }
+}
+
+resp = requests.post(
+    "https://api.runpod.ai/v2/google-nano-banana-2-edit/runsync",
+    headers={
+        "Authorization": f"Bearer {RUNPOD_API_KEY}",
+        "Content-Type": "application/json",
+    },
+    json=payload,
+    timeout=300,
+)
+
+resp.raise_for_status()
+data = resp.json()
+print(data)
+print("Output image URL:", data["output"]["image_url"])
+```
+
+```
+import requests
+
+out_url = data["output"]["image_url"]
+img_bytes = requests.get(out_url, timeout=120).content
+
+with open("edited.png", "wb") as f:
+    f.write(img_bytes)
+```
+
+steps:
+
+generate 4:3 aspect depth render and texture render.
+post texture render to cloudfare
+call runpod.io endpoint
+wait for image completion.
+Save image localy
+delete from bucket.
+
