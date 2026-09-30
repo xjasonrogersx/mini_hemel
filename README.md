@@ -141,3 +141,16 @@ Press `T` to read `config.json` and use the configured texture generator. For
 uploads them temporarily to the configured Cloudflare R2 bucket, calls the
 RunPod edit endpoint, downloads the result to `captures/`, and deletes the
 temporary bucket objects. The R2 public base URL must be reachable by RunPod.
+
+
+<img width="1261" height="740" alt="image" src="https://github.com/user-attachments/assets/15857e07-fdf6-4675-97c6-6f0e44e6054e" />
+
+<img width="1251" height="710" alt="image" src="https://github.com/user-attachments/assets/fd1af397-f8ae-4721-8f4c-25e22fe8bc34" />
+
+<img width="1272" height="871" alt="image" src="https://github.com/user-attachments/assets/41105b23-0898-4469-a7eb-3b093284c871" />
+
+
+python3 model_server/depth_anything_worker.py   --model depth-anything/Depth-Anything-V2-Small-hf   --rabbitmq-url amqp://guest:guest@192.168.1.220:5672/%2F
+
+python3 model_server/segformer_test.py    --rabbitmq-url amqp://guest:guest@192.168.1.220:5672/%2F
+
