@@ -212,6 +212,20 @@ class ViewerWebServer:
             f'<ul>{detection_rows}</ul>' if detection_rows else '<p class="muted">No detections yet.</p>'
         )
         dino_image = artifact.get("result_render") or ""
+        refined_asset = artifact.get("refined_asset")
+        refinement_status = artifact.get("refinement_status")
+        refined_asset_html = (
+            f'<a href="/captures/{html.escape(str(refined_asset))}">Download refined GLTF</a>'
+            if refined_asset else ""
+        )
+        refined_view_button = (
+            f'<button onclick="viewRefined()">View refined texture</button>'
+            if refined_asset and artifact.get("result_render") else ""
+        )
+        refinement_summary = (
+            f'<p class="muted">Refinement status: {html.escape(str(refinement_status))}. {refined_view_button} {refined_asset_html}</p>'
+            if refinement_status else ""
+        )
         pose = artifact.get("camera_pose", {})
         page = ARTIFACT_PAGE_HTML.format(
             index=index,
@@ -233,6 +247,7 @@ class ViewerWebServer:
                 {"prompt": prompt, "detection_index": detection_index}
                 for prompt, detection_index, _detection in detection_entries
             ]),
+            refinement_summary=refinement_summary,
         )
         data = page.encode("utf-8")
         handler.send_response(200)
@@ -263,15 +278,17 @@ button,select,input {{ border:1px solid var(--line); background:var(--panel); bo
 .dino-stage {{ position:relative; width:min(900px,100%); background:#080b10; }} .dino-stage img {{ display:block; width:100%; height:auto; }} .dino-stage canvas {{ position:absolute; inset:0; width:100%; height:100%; }}
 </style></head><body><main>
 <div class="head"><div><a href="/">&larr; All artifacts</a><h1>{title}</h1><div class="muted">{generator} &middot; {created_at}</div></div><div class="muted">yaw {yaw} &middot; pitch {pitch} &middot; distance {distance}</div></div>
-<p><button onclick="navigate()">Navigate display to this pose</button> <button onclick="segment()">Run / rerun SegFormer</button> <button onclick="mask2former()">Run / rerun Mask2Former</button> <span id="status" class="status"></span></p>
+<p><button onclick="navigate()">Navigate display to this pose</button> <button onclick="segment()">Run / rerun SegFormer</button> <button onclick="mask2former()">Run / rerun Mask2Former</button> <button onclick="refineMesh()">Build refined mesh</button> <span id="status" class="status"></span></p>{refinement_summary}
 <h2>Artifact images</h2><div class="images">{images}</div>
 <h2>Compare images from this artifact</h2><div class="controls"><label for="imageA">Image A</label><select id="imageA" onchange="updateCompare()">{options}</select><label for="imageB">Image B</label><select id="imageB" onchange="updateCompare()">{options}</select></div>
 <div class="stage"><img id="bottom" src="/captures/{first_image}" alt="Image B"><img id="top" class="top" src="/captures/{second_image}" alt="Image A"><div id="divider" class="divider"></div></div><label for="slider">Swipe position</label><br><input id="slider" class="range" type="range" min="0" max="100" value="50" oninput="updateCompare()">
 <h2>Grounding DINO</h2><div class="controls"><label for="dinoPrompt">Text prompt</label><input id="dinoPrompt" value="door"><button onclick="groundingDino()">Run / rerun Grounding DINO</button><button onclick="sam2All()">Run SAM2 on all boxes</button></div>{detection_report}<div class="dino-stage"><img id="dinoImage" src="/captures/{dino_image}" alt="Generated result image for Grounding DINO" onerror="this.alt='Generated result image unavailable'"><canvas id="dinoCanvas"></canvas></div>
 <script>
 async function navigate() {{ const status=document.getElementById('status'); status.textContent='Navigating...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'navigate',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Display moved to this pose':data.error; }}
+async function viewRefined() {{ const status=document.getElementById('status'); status.textContent='Loading refined texture...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'view_refined',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Refined texture loaded in viewer':data.error; }}
 async function segment() {{ const status=document.getElementById('status'); status.textContent='Starting SegFormer...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'segment',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'SegFormer started; refresh this page when complete':data.error; }}
 async function mask2former() {{ const status=document.getElementById('status'); status.textContent='Starting Mask2Former...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'mask2former',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Mask2Former started; refresh this page when complete':data.error; }}
+async function refineMesh() {{ const status=document.getElementById('status'); status.textContent='Starting mesh refinement...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'refine_mesh',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Mesh refinement started; refresh this page when complete':data.error; }}
 async function groundingDino() {{ const status=document.getElementById('status'); status.textContent='Starting Grounding DINO...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'grounding_dino',index:{index},prompt:document.getElementById('dinoPrompt').value}})}}); const data=await response.json(); status.textContent=data.ok?'Grounding DINO started; refresh this page when complete':data.error; }}
 async function sam2All() {{ const status=document.getElementById('status'); status.textContent='Starting SAM2 for all boxes...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'sam2_all',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'SAM2 started for all boxes; refresh this page when complete':data.error; }}
 async function deleteDino(entryIndex) {{ const target=detectionTargets[entryIndex]; if(!target || !window.confirm('Delete this Grounding DINO detection?')) return; const status=document.getElementById('status'); status.textContent='Deleting detection...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'delete_dino_detection',index:{index},prompt:target.prompt,detection_index:target.detection_index}})}}); const data=await response.json(); if(data.ok) window.location.reload(); else status.textContent=data.error; }}

@@ -4,6 +4,7 @@ from pathlib import Path
 from datetime import datetime
 import base64
 import boto3
+import hashlib
 import io
 import json
 import logging
@@ -11,6 +12,7 @@ import math
 import os
 import queue
 import requests
+import shutil
 import threading
 import time
 import uuid
@@ -23,6 +25,7 @@ import trimesh
 from botocore.config import Config
 from PIL import Image, ImageOps
 from web_server import ViewerWebServer
+from mesh_refinement import project_points, project_scene_faces, sample_mask
 
 
 ASSET_PATH = Path(__file__).with_name("merged.gltf")
@@ -61,7 +64,11 @@ WEB_PORT = int(os.getenv("VIEWER_WEB_PORT", "8765"))
 LOGGER = logging.getLogger(__name__)
 
 
-def load_scene(asset_path: Path) -> tuple[pyrender.Scene, pyrender.PerspectiveCamera]:
+def load_scene(
+	asset_path: Path,
+	texture_path: Path | None = None,
+	camera_pose: dict[str, object] | None = None,
+) -> tuple[pyrender.Scene, pyrender.PerspectiveCamera]:
 	loaded = trimesh.load(asset_path, file_type="gltf", force="scene")
 	if not isinstance(loaded, trimesh.Scene):
 		loaded = trimesh.Scene(loaded)
@@ -76,6 +83,25 @@ def load_scene(asset_path: Path) -> tuple[pyrender.Scene, pyrender.PerspectiveCa
 		ambient_light=[1.0, 1.0, 1.0],
 	)
 	meshes = loaded.dump(concatenate=False)
+	if texture_path is not None:
+		if camera_pose is None or "matrix" not in camera_pose:
+			raise ValueError("camera pose is required for a view-projected texture")
+		capture_size = camera_pose.get("capture_size", {})
+		if not isinstance(capture_size, dict) or "width" not in capture_size or "height" not in capture_size:
+			raise ValueError("capture size is required for a view-projected texture")
+		texture = Image.open(texture_path).convert("RGB")
+		for mesh in meshes:
+			pixels, _depths = project_points(
+				np.asarray(mesh.vertices), camera_pose["matrix"], capture_size
+			)
+			uv = np.column_stack((
+				pixels[:, 0] / float(capture_size["width"]),
+				1.0 - pixels[:, 1] / float(capture_size["height"]),
+			))
+			mesh.visual.uv = uv
+			material = getattr(mesh.visual, "material", None)
+			if material is not None and hasattr(material, "baseColorTexture"):
+				material.baseColorTexture = texture
 	render_scene.add(pyrender.Mesh.from_trimesh(meshes, smooth=False))
 	render_scene._walk_meshes = meshes
 
@@ -207,6 +233,8 @@ class ModelWindow(pyglet.window.Window):
 			self.save_current_view()
 		elif action == "navigate":
 			self.navigate_to_artifact(int(command["index"]))
+		elif action == "view_refined":
+			self.view_refined_artifact(int(command["index"]))
 		elif action == "segment":
 			self.run_segmentation_for_artifact(int(command["index"]))
 		elif action == "mask2former":
@@ -230,6 +258,9 @@ class ModelWindow(pyglet.window.Window):
 			self.delete_grounding_dino_detection(
 				int(command["index"]), str(command["prompt"]), int(command["detection_index"])
 			)
+		elif action == "refine_mesh":
+			LOGGER.info("Mesh refinement web action dispatched: artifact=%s", command.get("index"))
+			self.run_mesh_refinement(int(command["index"]))
 		elif action == "set_options":
 			self.update_texture_options(command.get("options", {}))
 		else:
@@ -268,6 +299,31 @@ class ModelWindow(pyglet.window.Window):
 		)
 		self.set_caption(f"Navigated to artifact {index + 1}")
 
+	def view_refined_artifact(self, index: int) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		artifact = artifacts[index]
+		asset_name = artifact.get("refined_asset")
+		texture_name = artifact.get("result_render")
+		if not asset_name or not texture_name:
+			raise ValueError("artifact has no refined asset and generated result texture")
+		asset_path = CAPTURES_PATH / str(asset_name)
+		texture_path = CAPTURES_PATH / str(texture_name)
+		if not asset_path.is_file() or not texture_path.is_file():
+			raise ValueError("refined asset or generated result texture does not exist")
+		new_scene, new_camera = load_scene(
+			asset_path, texture_path=texture_path, camera_pose=artifact.get("camera_pose")
+		)
+		self.render_scene = new_scene
+		self.camera = new_camera
+		self.orbit_target = new_scene._orbit_center.copy()
+		self.distance = new_scene._orbit_extent * 2.4
+		self.update_camera()
+		self.navigate_to_artifact(index)
+		self.set_caption(f"Refined texture viewed for artifact {index + 1}")
+
 	def delete_grounding_dino_detection(self, index: int, prompt: str, detection_index: int) -> None:
 		with ARTIFACTS_LOCK:
 			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
@@ -290,6 +346,118 @@ class ModelWindow(pyglet.window.Window):
 			with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
 				json.dump(artifacts, artifacts_file, indent=2)
 		self.set_caption(f"Deleted Grounding DINO {prompt} detection {detection_index + 1}")
+
+	def run_mesh_refinement(self, index: int) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		threading.Thread(
+			target=self._run_mesh_refinement_worker,
+			args=(index,),
+			name=f"mesh-refinement-{index}",
+			daemon=True,
+		).start()
+		self.set_caption(f"Mesh refinement started for artifact {index + 1}")
+
+	def _run_mesh_refinement_worker(self, index: int) -> None:
+		try:
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			artifact = artifacts[index]
+			loaded = trimesh.load(ASSET_PATH, file_type="gltf", force="scene")
+			if not isinstance(loaded, trimesh.Scene):
+				loaded = trimesh.Scene(loaded)
+			camera_pose = artifact.get("camera_pose", {})
+			capture_size = camera_pose.get("capture_size", {})
+			if "matrix" not in camera_pose or not capture_size:
+				raise ValueError("artifact is missing camera matrix or capture size")
+			meshes = loaded.dump(concatenate=False)
+			mesh_inventory = []
+			total_vertices = 0
+			total_faces = 0
+			for mesh_index, mesh in enumerate(meshes):
+				vertices = int(len(mesh.vertices))
+				faces = int(len(mesh.faces))
+				total_vertices += vertices
+				total_faces += faces
+				mesh_inventory.append({
+					"mesh_index": mesh_index,
+					"vertices": vertices,
+					"faces": faces,
+					"has_uv": bool(mesh.visual.uv is not None),
+					"bounds": np.asarray(mesh.bounds, dtype=float).tolist(),
+				})
+			sidecar_name = f"refinement_{index}.json"
+			sidecar_path = CAPTURES_PATH / sidecar_name
+			refined_name = f"refined_{index}.gltf"
+			refined_bin_name = "merged.bin"
+			refined_path = CAPTURES_PATH / refined_name
+			shutil.copy2(ASSET_PATH, refined_path)
+			source_bin = ASSET_PATH.with_name(refined_bin_name)
+			if source_bin.is_file():
+				shutil.copy2(source_bin, refined_path.with_name(refined_bin_name))
+			source_hash = hashlib.sha256(ASSET_PATH.read_bytes()).hexdigest()
+			face_records = project_scene_faces(loaded, camera_pose, capture_size)
+			visible_faces = [
+				record for record in face_records
+				if record["in_front"] and record["in_frame"]
+			]
+			semantic_masks = []
+			for mask_name in artifact.get("mask2former_masks", []):
+				mask_path = CAPTURES_PATH / str(mask_name)
+				if mask_path.is_file():
+					semantic_masks.append(sample_mask(mask_path, face_records, capture_size))
+			sidecar = {
+				"version": 1,
+				"status": "projected",
+				"source_asset": ASSET_PATH.name,
+				"source_asset_sha256": source_hash,
+				"refined_asset": refined_name,
+				"artifact_index": index,
+				"camera_pose": artifact.get("camera_pose", {}),
+				"source_images": {
+					"result_render": artifact.get("result_render"),
+					"depth_render": artifact.get("depth_render"),
+					"generated_depth_render": artifact.get("generated_depth_render"),
+				},
+				"annotations": {
+					"segmentation_masks": artifact.get("segmentation_masks", []),
+					"mask2former_masks": artifact.get("mask2former_masks", []),
+					"grounding_dino_detections": artifact.get("grounding_dino_detections", {}),
+				},
+				"mesh": {
+					"mesh_count": len(meshes),
+					"total_vertices": total_vertices,
+					"total_faces": total_faces,
+					"items": mesh_inventory,
+				},
+				"projection": {
+					"yfov_degrees": 45.0,
+					"face_count": len(face_records),
+					"visible_face_count": len(visible_faces),
+					"faces": face_records,
+					"semantic_masks": semantic_masks,
+				},
+				"geometry_changes": [],
+			}
+			sidecar_path.write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index]["refinement_sidecar"] = sidecar_name
+				artifacts[index]["refined_asset"] = refined_name
+				artifacts[index]["refinement_status"] = "projected"
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			self.set_caption(f"Mesh inventory saved: {total_faces} faces, {total_vertices} vertices")
+			LOGGER.info(
+				"Mesh refinement inventory saved: artifact=%d meshes=%d faces=%d vertices=%d sidecar=%s",
+				index, len(meshes), total_faces, total_vertices, sidecar_path,
+			)
+		except Exception as exc:
+			self.set_caption(f"Mesh refinement failed: {exc}")
+			LOGGER.exception("Mesh refinement failed for artifact %d", index)
 
 	def run_segmentation_for_artifact(self, index: int) -> None:
 		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
