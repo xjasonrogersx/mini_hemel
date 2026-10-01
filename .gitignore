@@ -4,6 +4,7 @@ yolo11n-seg.pt
 captures/
 __pycache__/
 model_server/sam2_b.pt
+sam2_b.pt
 model_server/test/result.png
 config.json
 artifacts.json
