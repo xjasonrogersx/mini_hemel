@@ -90,11 +90,9 @@ def load_scene(
 		capture_size = camera_pose.get("capture_size", {})
 		if not isinstance(capture_size, dict) or "width" not in capture_size or "height" not in capture_size:
 			raise ValueError("capture size is required for a view-projected texture")
-		texture = ImageOps.fit(
-			Image.open(texture_path).convert("RGB"),
+		texture = Image.open(texture_path).convert("RGB").resize(
 			(int(capture_size["width"]), int(capture_size["height"])),
-			method=Image.Resampling.LANCZOS,
-			centering=(0.5, 0.5),
+			resample=Image.Resampling.LANCZOS,
 		)
 		projection_records = project_scene_faces(loaded, camera_pose, capture_size)
 		visible_keys = visible_face_keys(projection_records, capture_size)

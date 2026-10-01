@@ -33,7 +33,7 @@ def project_points(
     camera_points = (np.linalg.inv(pose) @ np.column_stack((points, np.ones(len(points)))).T).T[:, :3]
     depth = -camera_points[:, 2]
     focal_y = height / (2.0 * np.tan(np.deg2rad(yfov_degrees) / 2.0))
-    focal_x = focal_y / (width / height)
+    focal_x = focal_y
     pixels = np.column_stack((
         focal_x * camera_points[:, 0] / np.maximum(depth, 1e-12) + width / 2.0,
         height / 2.0 - focal_y * camera_points[:, 1] / np.maximum(depth, 1e-12),
