@@ -203,24 +203,14 @@ class ViewerWebServer:
             f'<li><strong>{html.escape(prompt)}: {html.escape(str(detection.get("label", "detection")))}</strong> '
             f'confidence {float(detection.get("score", 0)):.3f} '
             f'box [{", ".join(f"{float(value):.1f}" for value in detection.get("box_xyxy", []))}] '
-            f'<button onclick="sam2Box({entry_index}, {json.dumps(prompt)})">Run / rerun SAM2</button>'
+            f'<button onclick="sam2Box({entry_index})">Run / rerun SAM2</button>'
             f'{" &middot; mask: " + html.escape(str(detection["sam2_mask"])) if detection.get("sam2_mask") else ""}</li>'
             for entry_index, (prompt, _detection_index, detection) in enumerate(detection_entries)
         )
         detection_report = (
             f'<ul>{detection_rows}</ul>' if detection_rows else '<p class="muted">No detections yet.</p>'
         )
-        dino_image = artifact.get("result_render") or artifact.get("texture_render") or ""
-        detection_options = "".join(
-            f'<option value="{entry_index}">{html.escape(prompt)}: {html.escape(str(detection.get("label", "detection")))} '
-            f'({float(detection.get("score", 0)):.3f})</option>'
-            for entry_index, (prompt, _detection_index, detection) in enumerate(detection_entries)
-        )
-        dino_image_options = "".join(
-            f'<option value="{html.escape(filename)}"{(" selected" if filename == dino_image else "")}>{html.escape(label)}</option>'
-            for field, label, filename in available
-            if field in {"texture_render", "result_render"}
-        )
+        dino_image = artifact.get("result_render") or ""
         pose = artifact.get("camera_pose", {})
         page = ARTIFACT_PAGE_HTML.format(
             index=index,
@@ -237,8 +227,6 @@ class ViewerWebServer:
             fields=json.dumps({field: filename for field, _label, filename in available}),
             detection_report=detection_report,
             dino_image=html.escape(dino_image),
-            dino_image_options=dino_image_options,
-            detection_options=detection_options,
             detections_json=json.dumps(detections),
             detection_targets=json.dumps([
                 {"prompt": prompt, "detection_index": detection_index}
@@ -278,19 +266,18 @@ button,select,input {{ border:1px solid var(--line); background:var(--panel); bo
 <h2>Artifact images</h2><div class="images">{images}</div>
 <h2>Compare images from this artifact</h2><div class="controls"><label for="imageA">Image A</label><select id="imageA" onchange="updateCompare()">{options}</select><label for="imageB">Image B</label><select id="imageB" onchange="updateCompare()">{options}</select></div>
 <div class="stage"><img id="bottom" src="/captures/{first_image}" alt="Image B"><img id="top" class="top" src="/captures/{second_image}" alt="Image A"><div id="divider" class="divider"></div></div><label for="slider">Swipe position</label><br><input id="slider" class="range" type="range" min="0" max="100" value="50" oninput="updateCompare()">
-<h2>Grounding DINO</h2><div class="controls"><label for="dinoPrompt">Text prompt</label><input id="dinoPrompt" value="door"><button onclick="groundingDino()">Run / rerun Grounding DINO</button><label for="dinoImageSelect">Artifact image</label><select id="dinoImageSelect" onchange="changeDinoImage()">{dino_image_options}</select><label for="dinoDetection">Selected detection</label><select id="dinoDetection" onchange="drawDetections()">{detection_options}</select></div>{detection_report}<div class="dino-stage"><img id="dinoImage" src="/captures/{dino_image}" alt="Grounding DINO source" onerror="this.alt='Artifact image unavailable'"><canvas id="dinoCanvas"></canvas></div>
+<h2>Grounding DINO</h2><div class="controls"><label for="dinoPrompt">Text prompt</label><input id="dinoPrompt" value="door"><button onclick="groundingDino()">Run / rerun Grounding DINO</button></div>{detection_report}<div class="dino-stage"><img id="dinoImage" src="/captures/{dino_image}" alt="Generated result image for Grounding DINO" onerror="this.alt='Generated result image unavailable'"><canvas id="dinoCanvas"></canvas></div>
 <script>
 async function navigate() {{ const status=document.getElementById('status'); status.textContent='Navigating...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'navigate',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Display moved to this pose':data.error; }}
 async function segment() {{ const status=document.getElementById('status'); status.textContent='Starting SegFormer...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'segment',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'SegFormer started; refresh this page when complete':data.error; }}
 async function mask2former() {{ const status=document.getElementById('status'); status.textContent='Starting Mask2Former...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'mask2former',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Mask2Former started; refresh this page when complete':data.error; }}
 async function groundingDino() {{ const status=document.getElementById('status'); status.textContent='Starting Grounding DINO...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'grounding_dino',index:{index},prompt:document.getElementById('dinoPrompt').value}})}}); const data=await response.json(); status.textContent=data.ok?'Grounding DINO started; refresh this page when complete':data.error; }}
 const detectionTargets={detection_targets};
-async function sam2Box(entryIndex, prompt) {{ const target=detectionTargets[entryIndex]; const status=document.getElementById('status'); status.textContent='Starting SAM2...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'sam2_box',index:{index},prompt:target.prompt,detection_index:target.detection_index}})}}); const data=await response.json(); status.textContent=data.ok?'SAM2 started; refresh this page when complete':data.error; }}
+async function sam2Box(entryIndex) {{ const target=detectionTargets[entryIndex]; const status=document.getElementById('status'); status.textContent='Starting SAM2...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'sam2_box',index:{index},prompt:target.prompt,detection_index:target.detection_index}})}}); const data=await response.json(); status.textContent=data.ok?'SAM2 started; refresh this page when complete':data.error; }}
 function updateCompare() {{ const a=document.getElementById('imageA').value,b=document.getElementById('imageB').value,p=Number(document.getElementById('slider').value); const fields={fields}; document.getElementById('bottom').src='/captures/'+encodeURIComponent(fields[b]); document.getElementById('top').src='/captures/'+encodeURIComponent(fields[a]); document.getElementById('top').style.clipPath='inset(0 '+(100-p)+'% 0 0)'; document.getElementById('divider').style.left=p+'%'; }}
 const dinoDetections={detections_json};
 function promptColor(prompt) {{ let hash=0; for(let index=0; index<prompt.length; index++) hash=((hash<<5)-hash)+prompt.charCodeAt(index); const hue=Math.abs(hash)%360; return 'hsl('+hue+',85%,62%)'; }}
-function changeDinoImage() {{ const image=document.getElementById('dinoImage'); image.src='/captures/'+encodeURIComponent(document.getElementById('dinoImageSelect').value); }}
-function drawDetections() {{ const image=document.getElementById('dinoImage'); const canvas=document.getElementById('dinoCanvas'); if(!image || !canvas || !image.naturalWidth) return; const scale=image.clientWidth/image.naturalWidth; canvas.width=image.clientWidth; canvas.height=image.clientHeight; const context=canvas.getContext('2d'); context.clearRect(0,0,canvas.width,canvas.height); const selected=Number(document.getElementById('dinoDetection').value); dinoDetections.forEach((detection,index)=>{{ const box=detection.box_xyxy.map(value=>value*scale); const active=index===selected; const color=promptColor(detection.prompt||'default'); context.strokeStyle=color; context.lineWidth=active?4:2; context.strokeRect(box[0],box[1],box[2]-box[0],box[3]-box[1]); context.fillStyle=color; context.font='bold 14px sans-serif'; context.fillText((index+1)+': '+detection.label+' '+Number(detection.score).toFixed(3),box[0]+4,Math.max(16,box[1]-5)); }}); }}
+function drawDetections() {{ const image=document.getElementById('dinoImage'); const canvas=document.getElementById('dinoCanvas'); if(!image || !canvas || !image.naturalWidth) return; const scale=image.clientWidth/image.naturalWidth; canvas.width=image.clientWidth; canvas.height=image.clientHeight; const context=canvas.getContext('2d'); context.clearRect(0,0,canvas.width,canvas.height); dinoDetections.forEach((detection,index)=>{{ const box=detection.box_xyxy.map(value=>value*scale); const color=promptColor(detection.prompt||'default'); context.strokeStyle=color; context.lineWidth=2; context.strokeRect(box[0],box[1],box[2]-box[0],box[3]-box[1]); context.fillStyle=color; context.font='bold 14px sans-serif'; context.fillText((index+1)+': '+detection.label+' '+Number(detection.score).toFixed(3),box[0]+4,Math.max(16,box[1]-5)); }}); }}
 document.getElementById('dinoImage').addEventListener('load',drawDetections); window.addEventListener('resize',drawDetections); drawDetections();
 </script></main></body></html>"""
 

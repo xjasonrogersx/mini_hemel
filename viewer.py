@@ -139,6 +139,15 @@ class ModelWindow(pyglet.window.Window):
 			"texture_generator": texture_config,
 		}
 
+	@staticmethod
+	def _rabbitmq_url(config: dict[str, object], section_name: str, settings: object) -> str:
+		if not isinstance(settings, dict) or settings.get("flow") != "rabbitmq":
+			raise ValueError(f"{section_name}.flow must be rabbitmq")
+		rabbitmq_url = config.get("rabbitmq_url")
+		if not isinstance(rabbitmq_url, str) or not rabbitmq_url:
+			raise ValueError("config.json.rabbitmq_url is required")
+		return rabbitmq_url
+
 	def enqueue_web_command(self, command: dict[str, object]) -> dict[str, object]:
 		completion = threading.Event()
 		result: dict[str, object] = {}
@@ -280,9 +289,7 @@ class ModelWindow(pyglet.window.Window):
 			segmentation_config = config.get("segmentation_generator", {})
 			if not isinstance(segmentation_config, dict):
 				raise ValueError("config.json is missing segmentation_generator")
-			rabbitmq_url = segmentation_config.get("rabbitmq_url")
-			if not rabbitmq_url:
-				raise ValueError("segmentation_generator.rabbitmq_url is required")
+			rabbitmq_url = self._rabbitmq_url(config, "segmentation_generator", segmentation_config)
 			queue_name = segmentation_config.get("queue", "segformer")
 			classes = segmentation_config.get("classes", [])
 			request = {
@@ -380,15 +387,14 @@ class ModelWindow(pyglet.window.Window):
 			with CONFIG_PATH.open(encoding="utf-8") as config_file:
 				config = json.load(config_file)
 			settings = config.get("mask2former_generator", {})
-			if not isinstance(settings, dict) or not settings.get("rabbitmq_url"):
-				raise ValueError("config.json is missing mask2former_generator.rabbitmq_url")
+			rabbitmq_url = self._rabbitmq_url(config, "mask2former_generator", settings)
 			request = {
 				"image_base64": base64.b64encode(image_path.read_bytes()).decode("ascii"),
 				"classes": settings.get("classes", []),
 			}
 			import pika
 			correlation_id = str(uuid.uuid4())
-			parameters = pika.URLParameters(settings["rabbitmq_url"])
+			parameters = pika.URLParameters(rabbitmq_url)
 			parameters.heartbeat = 0
 			connection = pika.BlockingConnection(parameters)
 			channel = connection.channel()
@@ -540,9 +546,11 @@ class ModelWindow(pyglet.window.Window):
 	def _run_grounding_dino_worker(self, index: int, image_path: Path, prompt: str) -> None:
 		try:
 			with CONFIG_PATH.open(encoding="utf-8") as config_file:
-				settings = json.load(config_file).get("grounding_dino_generator", {})
-			if not isinstance(settings, dict) or not settings.get("rabbitmq_url"):
-				raise ValueError("config.json is missing grounding_dino_generator.rabbitmq_url")
+				config = json.load(config_file)
+				settings = config.get("grounding_dino_generator", {})
+				rabbitmq_url = self._rabbitmq_url(config, "grounding_dino_generator", settings)
+				settings = dict(settings)
+				settings["rabbitmq_url"] = rabbitmq_url
 			result = self._rabbitmq_request(settings, settings.get("queue", "grounding-dino"), {
 				"image_base64": base64.b64encode(image_path.read_bytes()).decode("ascii"),
 				"text_prompt": prompt,
@@ -568,9 +576,11 @@ class ModelWindow(pyglet.window.Window):
 	def _run_sam2_box_worker(self, index: int, prompt: str, detection_index: int, image_path: Path, box: list) -> None:
 		try:
 			with CONFIG_PATH.open(encoding="utf-8") as config_file:
-				settings = json.load(config_file).get("sam2_generator", {})
-			if not isinstance(settings, dict) or not settings.get("rabbitmq_url"):
-				raise ValueError("config.json is missing sam2_generator.rabbitmq_url")
+				config = json.load(config_file)
+				settings = config.get("sam2_generator", {})
+				rabbitmq_url = self._rabbitmq_url(config, "sam2_generator", settings)
+				settings = dict(settings)
+				settings["rabbitmq_url"] = rabbitmq_url
 			result = self._rabbitmq_request(settings, settings.get("queue", "sam2"), {
 				"image_base64": base64.b64encode(image_path.read_bytes()).decode("ascii"),
 				"bboxes": [box],
@@ -988,8 +998,7 @@ class ModelWindow(pyglet.window.Window):
 		depth_config = config.get("depth_generator")
 		if not isinstance(depth_config, dict):
 			raise ValueError("config.json is missing depth_generator")
-		if not depth_config.get("rabbitmq_url"):
-			raise ValueError("depth_generator.rabbitmq_url is required")
+		rabbitmq_url = ModelWindow._rabbitmq_url(config, "depth_generator", depth_config)
 		queue = depth_config.get("queue", "depth-anything")
 		model = depth_config.get("model", "depth-anything/Depth-Anything-V2")
 		request = {
@@ -1003,7 +1012,7 @@ class ModelWindow(pyglet.window.Window):
 			image_path.name,
 		)
 		import pika
-		parameters = pika.URLParameters(depth_config["rabbitmq_url"])
+		parameters = pika.URLParameters(rabbitmq_url)
 		parameters.heartbeat = 0
 		connection = pika.BlockingConnection(parameters)
 		channel = connection.channel()

@@ -1,0 +1,46 @@
+{
+    "rabbitmq_url": "amqp://guest:guest@localhost:5672/%2F",
+
+    "texture_generator": {
+        "model": "runpod_nano_banana_2",
+        "key": "YOUR_RUNPOD_API_KEY",
+        "prompt": "improve texture quality, enhance details, remove cars and people",
+        "resolution": "1k",
+        "aspect_ratio": "4:3"
+    },
+    "depth_generator": {
+        "flow": "rabbitmq",
+        "model": "depth-anything/Depth-Anything-V2",
+        "queue": "depth-anything"
+    },
+    "segmentation_generator": {
+        "flow": "rabbitmq",
+        "model": "nvidia/segformer-b0-finetuned-ade-512-512",
+        "queue": "segformer",
+        "classes": ["building", "wall", "house", "roof", "window", "door", "tree", "street", "sidewalk"]
+    },
+    "mask2former_generator": {
+        "flow": "rabbitmq",
+        "model": "facebook/mask2former-swin-small-ade-semantic",
+        "queue": "mask2former",
+        "classes": ["building", "wall", "house", "roof", "window", "door", "tree", "street", "sidewalk"]
+    },
+    "grounding_dino_generator": {
+        "flow": "rabbitmq",
+        "model": "IDEA-Research/grounding-dino-tiny",
+        "queue": "grounding-dino",
+        "threshold": 0.35,
+        "text_threshold": 0.25
+    },
+    "sam2_generator": {
+        "flow": "rabbitmq",
+        "model": "sam2_b.pt",
+        "queue": "sam2"
+    },
+    "r2": {
+        "account_id": "YOUR_R2_ACCOUNT_ID",
+        "access_key": "YOUR_R2_ACCESS_KEY",
+        "secret_key": "YOUR_R2_SECRET_KEY",
+        "bucket": "YOUR_R2_BUCKET"
+    }
+}
