@@ -4,6 +4,7 @@ from pathlib import Path
 from datetime import datetime
 import base64
 import boto3
+import copy
 import hashlib
 import io
 import json
@@ -25,7 +26,7 @@ import trimesh
 from botocore.config import Config
 from PIL import Image, ImageOps
 from web_server import ViewerWebServer
-from mesh_refinement import project_points, project_scene_faces, sample_mask
+from mesh_refinement import project_points, project_scene_faces, sample_mask, visible_face_keys
 
 
 ASSET_PATH = Path(__file__).with_name("merged.gltf")
@@ -89,25 +90,55 @@ def load_scene(
 		capture_size = camera_pose.get("capture_size", {})
 		if not isinstance(capture_size, dict) or "width" not in capture_size or "height" not in capture_size:
 			raise ValueError("capture size is required for a view-projected texture")
-		texture = Image.open(texture_path).convert("RGB")
-		for mesh in meshes:
+		texture = ImageOps.fit(
+			Image.open(texture_path).convert("RGB"),
+			(int(capture_size["width"]), int(capture_size["height"])),
+			method=Image.Resampling.LANCZOS,
+			centering=(0.5, 0.5),
+		)
+		projection_records = project_scene_faces(loaded, camera_pose, capture_size)
+		visible_keys = visible_face_keys(projection_records, capture_size)
+		projected_meshes = []
+		for mesh_index, mesh in enumerate(meshes):
+			visible_faces = [
+				face_index for face_index in range(len(mesh.faces))
+				if (mesh_index, face_index) in visible_keys
+			]
+			occluded_faces = [
+				face_index for face_index in range(len(mesh.faces))
+				if (mesh_index, face_index) not in visible_keys
+			]
+			if occluded_faces:
+				projected_meshes.append(mesh.submesh([occluded_faces], append=True, repair=False))
+			if not visible_faces:
+				continue
+			visible_mesh = mesh.submesh([visible_faces], append=True, repair=False)
 			pixels, _depths = project_points(
-				np.asarray(mesh.vertices), camera_pose["matrix"], capture_size
+				np.asarray(visible_mesh.vertices), camera_pose["matrix"], capture_size
 			)
-			uv = np.column_stack((
-				pixels[:, 0] / float(capture_size["width"]),
-				1.0 - pixels[:, 1] / float(capture_size["height"]),
+			visible_mesh.visual.uv = np.column_stack((
+				np.clip(pixels[:, 0] / float(capture_size["width"]), 0.0, 1.0),
+				np.clip(1.0 - pixels[:, 1] / float(capture_size["height"]), 0.0, 1.0),
 			))
-			mesh.visual.uv = uv
-			material = getattr(mesh.visual, "material", None)
+			material = getattr(visible_mesh.visual, "material", None)
 			if material is not None and hasattr(material, "baseColorTexture"):
-				material.baseColorTexture = texture
+				visible_mesh.visual.material = copy.deepcopy(material)
+				visible_mesh.visual.material.baseColorTexture = texture
+			projected_meshes.append(visible_mesh)
+		meshes = projected_meshes
+		render_scene._projected_visible_faces = len(visible_keys)
+		render_scene._projected_total_faces = sum(len(mesh.faces) for mesh in meshes)
 	render_scene.add(pyrender.Mesh.from_trimesh(meshes, smooth=False))
 	render_scene._walk_meshes = meshes
 
 	camera = pyrender.PerspectiveCamera(
 		yfov=math.radians(45.0),
-		aspectRatio=WINDOW_WIDTH / WINDOW_HEIGHT,
+		aspectRatio=(
+			float(camera_pose["capture_size"]["width"])
+			/ float(camera_pose["capture_size"]["height"])
+			if texture_path is not None and camera_pose is not None
+			else WINDOW_WIDTH / WINDOW_HEIGHT
+		),
 		znear=max(extent * CAMERA_NEAR_RATIO, 0.001),
 		zfar=extent * CAMERA_FAR_RATIO,
 	)
@@ -132,6 +163,9 @@ class ModelWindow(pyglet.window.Window):
 		self.camera = camera
 		self.renderer = pyrender.OffscreenRenderer(WINDOW_WIDTH, WINDOW_HEIGHT)
 		self.mode = "textured"
+		self.show_edges = False
+		self._edge_overlay = None
+		self._edge_cache_key = None
 		self.yaw = math.radians(35.0)
 		self.pitch = math.radians(18.0)
 		self.distance = render_scene._orbit_extent * 2.4
@@ -157,6 +191,7 @@ class ModelWindow(pyglet.window.Window):
 		texture_config.pop("key", None)
 		return {
 			"mode": self.mode,
+			"show_edges": self.show_edges,
 			"walk_mode": self.walk_mode,
 			"yaw": self.yaw,
 			"pitch": self.pitch,
@@ -210,6 +245,9 @@ class ModelWindow(pyglet.window.Window):
 				raise ValueError("mode must be textured or depth")
 			self.mode = str(mode)
 			self.set_caption(f"merged.gltf | {self.mode}")
+		elif action == "toggle_edges":
+			self.show_edges = not self.show_edges
+			self.set_caption(f"merged.gltf | edges {'on' if self.show_edges else 'off'}")
 		elif action == "set_navigation":
 			navigation_mode = command.get("mode")
 			if navigation_mode == "walk" and not self.walk_mode:
@@ -920,7 +958,31 @@ class ModelWindow(pyglet.window.Window):
 		else:
 			self.color_buffer, _ = self.renderer.render(self.render_scene, flags=flags)
 			self.color_buffer = self.color_buffer.copy()
+		if self.show_edges:
+			self.draw_triangle_edges()
 		self.invalid = True
+
+	def draw_triangle_edges(self) -> None:
+		"""Overlay pyrender's native wireframe pass in white."""
+		camera_pose = self.render_scene.get_pose(self.render_scene._orbit_camera_node)
+		cache_key = (
+			self.width,
+			self.height,
+			id(self.render_scene._walk_meshes),
+			tuple(np.round(camera_pose.ravel(), 6)),
+		)
+		if cache_key != self._edge_cache_key:
+			wire_color, _wire_depth = self.renderer.render(
+				self.render_scene,
+				flags=pyrender.RenderFlags.RGBA | pyrender.RenderFlags.ALL_WIREFRAME,
+			)
+			background = np.asarray(self.render_scene.bg_color[:3], dtype=np.float32) * 255.0
+			self._edge_overlay = np.max(
+				np.abs(wire_color[:, :, :3].astype(np.float32) - background), axis=2
+			) > 3.0
+			self._edge_cache_key = cache_key
+		if self._edge_overlay is not None:
+			self.color_buffer[self._edge_overlay, :3] = 255
 
 	def on_draw(self) -> None:
 		self.clear()
@@ -955,6 +1017,10 @@ class ModelWindow(pyglet.window.Window):
 		if symbol == pyglet.window.key.F:
 			self.set_fullscreen(not self.fullscreen)
 			self.set_exclusive_mouse(self.fullscreen and self.walk_mode)
+			return
+		if symbol == pyglet.window.key.E:
+			self.show_edges = not self.show_edges
+			self.set_caption(f"merged.gltf | edges {'on' if self.show_edges else 'off'}")
 			return
 		if symbol == pyglet.window.key.G and self.walk_mode:
 			self.walk_mode = False

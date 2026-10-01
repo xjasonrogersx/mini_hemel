@@ -338,7 +338,7 @@ article { background:var(--panel); border:1px solid var(--line); border-radius:6
 <section class="toolbar">
  <div class="group"><label for="mode">Display</label><select id="mode"><option value="textured">Textured</option><option value="depth">Depth</option></select><button onclick="setMode()">Apply</button></div>
  <div class="group"><label for="navigation">Camera</label><select id="navigation"><option value="orbit">Orbit</option><option value="walk">Walk</option></select><button onclick="setNavigation()">Apply</button></div>
- <button class="primary" onclick="generate('configured')">Generate configured texture</button><button onclick="generate('sdxl')">Generate SDXL</button><button onclick="saveView()">Save view</button>
+ <button class="primary" onclick="generate('configured')">Generate configured texture</button><button onclick="generate('sdxl')">Generate SDXL</button><button onclick="toggleEdges()">Toggle triangle edges</button><button onclick="saveView()">Save view</button>
  <span class="status" id="status"></span>
 </section>
 <section><h2>Texture options</h2><div class="toolbar"><label for="prompt">Prompt</label><input id="prompt"><label for="resolution">Resolution</label><select id="resolution"><option>1k</option><option>2k</option><option>4k</option></select><label for="aspect">Aspect</label><select id="aspect"><option>4:3</option><option>16:9</option><option>1:1</option></select><button onclick="saveOptions()">Save options</button></div></section>
@@ -350,6 +350,7 @@ async function post(body) { const r=await fetch('/api/control',{method:'POST',he
 function notice(text) { $('status').textContent=text; setTimeout(()=>{$('status').textContent=''},3500); }
 async function setMode(){ try { await post({action:'set_mode',mode:$('mode').value}); notice('Display mode updated'); } catch(e){notice(e.message)} }
 async function setNavigation(){ try { await post({action:'set_navigation',mode:$('navigation').value}); notice('Camera mode updated'); } catch(e){notice(e.message)} }
+async function toggleEdges(){ try { await post({action:'toggle_edges'}); notice('Triangle edges toggled'); load(); } catch(e){notice(e.message)} }
 async function generate(generator){ try { await post({action:'generate',generator}); notice('Generation started'); } catch(e){notice(e.message)} }
 async function saveView(){ try { await post({action:'save_view'}); notice('View capture started'); } catch(e){notice(e.message)} }
 async function saveOptions(){ try { await post({action:'set_options',options:{prompt:$('prompt').value,resolution:$('resolution').value,aspect_ratio:$('aspect').value}}); notice('Options saved'); } catch(e){notice(e.message)} }
