@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import html
 import logging
 from pathlib import Path
 import threading
@@ -77,6 +78,9 @@ class ViewerWebServer:
                 if parsed.path == "/api/artifacts":
                     self._send_json(owner._load_artifacts())
                     return
+                if parsed.path.startswith("/artifact/"):
+                    owner._send_artifact_page(self, parsed.path.removeprefix("/artifact/"))
+                    return
                 if parsed.path.startswith("/captures/"):
                     self._send_capture(parsed.path.removeprefix("/captures/"))
                     return
@@ -125,12 +129,83 @@ class ViewerWebServer:
         except (OSError, json.JSONDecodeError):
             return []
 
+    def _send_artifact_page(self, handler: BaseHTTPRequestHandler, value: str) -> None:
+        try:
+            index = int(value)
+        except ValueError:
+            handler.send_error(404, "invalid artifact")
+            return
+        artifacts = self._load_artifacts()
+        if index < 0 or index >= len(artifacts):
+            handler.send_error(404, "artifact not found")
+            return
+        artifact = artifacts[index]
+        image_fields = (
+            ("texture_render", "Texture input"),
+            ("result_render", "Generated result"),
+            ("depth_render", "Renderer depth"),
+            ("generated_depth_render", "Depth Anything"),
+        )
+        available = [(field, label, artifact[field]) for field, label in image_fields if artifact.get(field)]
+        options = "".join(
+            f'<option value="{html.escape(field)}">{html.escape(label)}</option>'
+            for field, label, _filename in available
+        )
+        images = "".join(
+            f'<figure><img src="/captures/{html.escape(filename)}" alt="{html.escape(label)}"><figcaption>{html.escape(label)}<br>{html.escape(filename)}</figcaption></figure>'
+            for _field, label, filename in available
+        )
+        pose = artifact.get("camera_pose", {})
+        page = ARTIFACT_PAGE_HTML.format(
+            index=index,
+            title=html.escape(f"Artifact {index + 1}"),
+            created_at=html.escape(str(artifact.get("created_at", ""))),
+            generator=html.escape(str(artifact.get("generator", "generated"))),
+            yaw=html.escape(str(pose.get("yaw", "?"))),
+            pitch=html.escape(str(pose.get("pitch", "?"))),
+            distance=html.escape(str(pose.get("distance", "?"))),
+            options=options,
+            images=images,
+            first_image=html.escape(available[0][2] if available else ""),
+            second_image=html.escape(available[1][2] if len(available) > 1 else (available[0][2] if available else "")),
+            fields=json.dumps({field: filename for field, _label, filename in available}),
+        )
+        data = page.encode("utf-8")
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/html; charset=utf-8")
+        handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        handler.send_header("Content-Length", str(len(data)))
+        handler.end_headers()
+        handler.wfile.write(data)
+
     def start(self) -> None:
         self.thread.start()
 
     def stop(self) -> None:
         self.server.shutdown()
         self.server.server_close()
+
+
+ARTIFACT_PAGE_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} | Mini Hemel</title>
+<style>
+:root {{ color-scheme:dark; --ink:#e9edf4; --muted:#93a0b4; --panel:#18202b; --line:#2b384a; --accent:#f0a35b; --cyan:#75d0c5; }}
+* {{ box-sizing:border-box; }} body {{ margin:0; background:#0d131b; color:var(--ink); font:14px/1.45 ui-sans-serif,system-ui,sans-serif; }}
+main {{ max-width:1200px; margin:auto; padding:24px clamp(18px,4vw,56px) 60px; }} a,button,select,input {{ color:inherit; }} a {{ color:var(--cyan); }}
+.head {{ display:flex; justify-content:space-between; gap:18px; align-items:start; border-bottom:1px solid var(--line); padding-bottom:18px; }} h1,h2 {{ font-family:Georgia,serif; }} h1 {{ margin:0; font-size:30px; }} h2 {{ margin:28px 0 12px; }} .muted,figcaption {{ color:var(--muted); }}
+button,select,input {{ border:1px solid var(--line); background:var(--panel); border-radius:5px; padding:9px 12px; font:inherit; }} button {{ cursor:pointer; }} button:hover {{ border-color:var(--accent); }}
+.images {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }} figure {{ margin:0; background:var(--panel); border:1px solid var(--line); border-radius:6px; overflow:hidden; }} figure img {{ display:block; width:100%; aspect-ratio:4/3; object-fit:contain; background:#080b10; }} figcaption {{ padding:9px; overflow-wrap:anywhere; }}
+.controls {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:14px 0; }} .stage {{ position:relative; aspect-ratio:4/3; max-width:900px; background:#080b10; overflow:hidden; }} .stage img {{ position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }} .top {{ clip-path:inset(0 50% 0 0); }} .divider {{ position:absolute; top:0; bottom:0; left:50%; width:2px; background:var(--accent); pointer-events:none; }} .range {{ width:min(900px,100%); accent-color:var(--accent); }} .status {{ color:var(--cyan); }}
+</style></head><body><main>
+<div class="head"><div><a href="/">&larr; All artifacts</a><h1>{title}</h1><div class="muted">{generator} &middot; {created_at}</div></div><div class="muted">yaw {yaw} &middot; pitch {pitch} &middot; distance {distance}</div></div>
+<p><button onclick="navigate()">Navigate display to this pose</button> <span id="status" class="status"></span></p>
+<h2>Artifact images</h2><div class="images">{images}</div>
+<h2>Compare images from this artifact</h2><div class="controls"><label for="imageA">Image A</label><select id="imageA" onchange="updateCompare()">{options}</select><label for="imageB">Image B</label><select id="imageB" onchange="updateCompare()">{options}</select></div>
+<div class="stage"><img id="bottom" src="/captures/{first_image}" alt="Image A"><img id="top" class="top" src="/captures/{second_image}" alt="Image B"><div id="divider" class="divider"></div></div><label for="slider">Swipe position</label><br><input id="slider" class="range" type="range" min="0" max="100" value="50" oninput="updateCompare()">
+<script>
+async function navigate() {{ const status=document.getElementById('status'); status.textContent='Navigating...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'navigate',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Display moved to this pose':data.error; }}
+function updateCompare() {{ const a=document.getElementById('imageA').value,b=document.getElementById('imageB').value,p=Number(document.getElementById('slider').value); const fields={fields}; document.getElementById('bottom').src='/captures/'+encodeURIComponent(fields[a]); document.getElementById('top').src='/captures/'+encodeURIComponent(fields[b]); document.getElementById('top').style.clipPath='inset(0 '+(100-p)+'% 0 0)'; document.getElementById('divider').style.left=p+'%'; }}
+</script></main></body></html>"""
 
 
 CONTROL_PANEL_HTML = r"""<!doctype html>
@@ -175,7 +250,6 @@ article { background:var(--panel); border:1px solid var(--line); border-radius:6
 <section><h2>Texture options</h2><div class="toolbar"><label for="prompt">Prompt</label><input id="prompt"><label for="resolution">Resolution</label><select id="resolution"><option>1k</option><option>2k</option><option>4k</option></select><label for="aspect">Aspect</label><select id="aspect"><option>4:3</option><option>16:9</option><option>1:1</option></select><button onclick="saveOptions()">Save options</button></div></section>
 <section><h2>Generated assets</h2><div class="assets" id="assets"><div class="empty">Loading artifacts...</div></div></section>
 </main>
-<div class="modal" id="compareModal" onclick="closeCompare(event)"><div class="dialog" onclick="event.stopPropagation()"><div class="dialog-head"><h2 id="compareTitle">Compare artifact images</h2><button onclick="closeCompare()">Close</button></div><div class="compare-controls"><label for="compareA">Image A</label><select id="compareA" onchange="updateCompare()"></select><label for="compareB">Image B</label><select id="compareB" onchange="updateCompare()"></select></div><div class="compare-stage"><img id="compareBottom" alt="Image A"><img id="compareTop" class="compare-top" alt="Image B"><div id="compareDivider" class="compare-divider"></div></div><label for="compareSlider">Swipe position</label><input id="compareSlider" class="compare-range" type="range" min="0" max="100" value="50" oninput="updateCompare()"></div></div>
 <script>
 const $ = id => document.getElementById(id);
 async function post(body) { const r=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); const data=await r.json(); if(!data.ok) throw Error(data.error); return data; }
@@ -187,14 +261,8 @@ async function saveView(){ try { await post({action:'save_view'}); notice('View 
 async function saveOptions(){ try { await post({action:'set_options',options:{prompt:$('prompt').value,resolution:$('resolution').value,aspect_ratio:$('aspect').value}}); notice('Options saved'); } catch(e){notice(e.message)} }
 function image(name,label){ if(!name) return '<figure><div style="aspect-ratio:4/3"></div><figcaption>'+label+' unavailable</figcaption></figure>'; return '<figure><img loading="lazy" src="/captures/'+encodeURIComponent(name)+'" alt="'+label+'"><figcaption>'+name+'</figcaption></figure>'; }
 let artifacts=[];
-let compareArtifact=null;
-function renderAssets(items){ artifacts=items; const root=$('assets'); if(!items.length){root.innerHTML='<div class="empty">No artifact records yet.</div>';return;} root.innerHTML=items.slice().reverse().map((a,i)=>'<article><div class="meta"><strong>'+((a.generator||'generated')+' · '+(a.created_at||''))+'</strong><small>Camera yaw '+Number(a.camera_pose?.yaw||0).toFixed(3)+' · pitch '+Number(a.camera_pose?.pitch||0).toFixed(3)+' · distance '+Number(a.camera_pose?.distance||0).toFixed(2)+'</small></div><div class="images">'+image(a.texture_render,'Texture input')+image(a.result_render,'Generated result')+image(a.depth_render,'Renderer depth')+image(a.generated_depth_render,'Depth Anything')+'</div><div class="actions"><button class="primary" onclick="navigateAsset('+items.indexOf(a)+')">Navigate display</button><button onclick="openCompare('+items.indexOf(a)+')">Compare images</button></div></article>').join(''); }
+function renderAssets(items){ artifacts=items; const root=$('assets'); if(!items.length){root.innerHTML='<div class="empty">No artifact records yet.</div>';return;} root.innerHTML=items.slice().reverse().map((a,i)=>'<article><div class="meta"><strong>'+((a.generator||'generated')+' · '+(a.created_at||''))+'</strong><small>Camera yaw '+Number(a.camera_pose?.yaw||0).toFixed(3)+' · pitch '+Number(a.camera_pose?.pitch||0).toFixed(3)+' · distance '+Number(a.camera_pose?.distance||0).toFixed(2)+'</small></div><div class="images">'+image(a.texture_render,'Texture input')+image(a.result_render,'Generated result')+image(a.depth_render,'Renderer depth')+image(a.generated_depth_render,'Depth Anything')+'</div><div class="actions"><a href="/artifact/'+items.indexOf(a)+'">Open artifact</a><button onclick="navigateAsset('+items.indexOf(a)+')">Navigate display</button></div></article>').join(''); }
 async function navigateAsset(index){ try { await post({action:'navigate',index}); notice('Display moved to asset camera'); } catch(e){notice(e.message)} }
-function artifactImages(asset){ return [['texture_render','Texture input'],['result_render','Generated result'],['depth_render','Renderer depth'],['generated_depth_render','Depth Anything']].filter(item=>asset[item[0]]); }
-function imageUrl(asset, field){ return asset[field]; }
-function openCompare(index){ compareArtifact=artifacts[index]; if(!compareArtifact)return; const available=artifactImages(compareArtifact); if(available.length<2){notice('This artifact has fewer than two images');return;} const options=available.map(item=>'<option value="'+item[0]+'">'+item[1]+'</option>').join(''); $('compareA').innerHTML=options; $('compareB').innerHTML=options; $('compareB').value=available[1][0]; $('compareTitle').textContent='Compare artifact '+(index+1); $('compareModal').classList.add('open'); updateCompare(); }
-function closeCompare(event){ if(!event||event.target===$('compareModal')) $('compareModal').classList.remove('open'); }
-function updateCompare(){ if(!compareArtifact)return; const a=$('compareA').value, b=$('compareB').value; const position=Number($('compareSlider').value); $('compareBottom').src='/captures/'+encodeURIComponent(imageUrl(compareArtifact,a)); $('compareTop').src='/captures/'+encodeURIComponent(imageUrl(compareArtifact,b)); $('compareBottom').alt=a; $('compareTop').alt=b; $('compareTop').style.clipPath='inset(0 '+(100-position)+'% 0 0)'; $('compareDivider').style.left=position+'%'; }
 async function load(){ try { const [state,items]=await Promise.all([fetch('/api/state').then(r=>r.json()),fetch('/api/artifacts').then(r=>r.json())]); $('state').textContent=state.mode+' · '+(state.walk_mode?'walk':'orbit'); $('mode').value=state.mode; $('navigation').value=state.walk_mode?'walk':'orbit'; const t=state.texture_generator||{}; $('prompt').value=t.prompt||''; $('resolution').value=t.resolution||'1k'; $('aspect').value=t.aspect_ratio||'4:3'; renderAssets(items); } catch(e){$('state').textContent='Offline';} }
 load(); setInterval(load,5000);
 </script>
