@@ -992,6 +992,18 @@ class ModelWindow(pyglet.window.Window):
 			if self.walk_mode:
 				self.walk_look_drag = not self.fullscreen
 				return
+			now = time.monotonic()
+			if (
+				self.last_click is not None
+				and now - self.last_click[0] <= 0.35
+				and (x - self.last_click[1]) ** 2 + (y - self.last_click[2]) ** 2 <= 12 ** 2
+				and not modifiers & pyglet.window.key.MOD_SHIFT
+			):
+				self.last_click = None
+				if self.enter_walk_mode(x, y):
+					self.orbit_button = None
+				return
+			self.last_click = (now, x, y)
 			self.orbit_button = "orbit" if modifiers & pyglet.window.key.MOD_SHIFT else "pan"
 		elif button == pyglet.window.mouse.MIDDLE:
 			if self.walk_mode:
@@ -1027,10 +1039,11 @@ class ModelWindow(pyglet.window.Window):
 		if self.walk_mode and self.fullscreen:
 			self.turn_camera(-dx * 0.004, dy * 0.004)
 
-	def enter_walk_mode(self, x: int, y: int) -> None:
+	def enter_walk_mode(self, x: int, y: int) -> bool:
 		hit = self.scene_hit(x, y)
 		if hit is None:
-			return
+			LOGGER.warning("Walk-mode double-click missed the scene at x=%d y=%d", x, y)
+			return False
 		camera_position, forward = hit
 		forward[1] = 0.0
 		if np.linalg.norm(forward) < 1e-6:
@@ -1043,6 +1056,8 @@ class ModelWindow(pyglet.window.Window):
 		self.walk_height = float(eye_height)
 		self.set_exclusive_mouse(self.fullscreen)
 		self.update_walk_caption()
+		LOGGER.info("Entered walk mode at x=%d y=%d position=%s", x, y, camera_position.tolist())
+		return True
 
 	def update_walk_caption(self) -> None:
 		self.set_caption(
