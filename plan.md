@@ -78,6 +78,23 @@ Use road, sidewalk, and tree semantic masks; window and door masks; SAM2 masks; 
 
 First produce a preview with highlighted candidate faces. Apply geometry changes only after visual review.
 
+#### 4A. Depth-guided conservative edit
+
+The first applied implementation slice is complete:
+
+1. Load `generated_depth_render` as normalized relative depth.
+2. Resize depth maps to the artifact camera frame and record source/projection dimensions.
+3. Compute per-face relative-depth mean/range and gradient evidence.
+4. Mark the evidence as `relative_only`; values are never interpreted as metres.
+5. Fit local planes independently per connected candidate component.
+6. Blend toward the fitted plane and clamp each vertex displacement to 1% of the component extent.
+7. Export and reload a separate GLTF; keep the source asset unchanged.
+
+Depth Anything remains relative-only: it gates smooth interior regions and
+provides ordering/edge evidence, but is never converted into metres. Road and
+sidewalk masks drive ground candidates; vertical front-facing regions drive
+facade candidates while tree and high-gradient boundaries are protected.
+
 ### 5. Increase Polygon Count
 
 1. Subdivide selected road, sidewalk, facade, window, and door regions.

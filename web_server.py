@@ -149,6 +149,7 @@ class ViewerWebServer:
             ("segmentation_label_map", "SegFormer label map"),
             ("mask2former_color_map", "Mask2Former color map"),
             ("mask2former_label_map", "Mask2Former label map"),
+            ("building_regularization_edges", "Building Canny edges"),
         )
         available = [(field, label, artifact[field]) for field, label in image_fields if artifact.get(field)]
         available.extend(
@@ -218,6 +219,17 @@ class ViewerWebServer:
             f'<a href="/captures/{html.escape(str(refined_asset))}">Download refined GLTF</a>'
             if refined_asset else ""
         )
+        road_asset = artifact.get("road_smoothing_asset")
+        road_asset_html = (
+            f'<a href="/captures/{html.escape(str(road_asset))}">Download smoothed road GLTF</a>'
+            if road_asset else ""
+        )
+        building_asset = artifact.get("building_regularization_asset")
+        building_outputs_html = " ".join(
+            link for link in (
+                f'<a href="/captures/{html.escape(str(building_asset))}">Download regularized buildings GLTF</a>' if building_asset else "",
+            ) if link
+        )
         refined_view_button = (
             f'<button onclick="viewRefined()">View refined texture</button>'
             if refined_asset and artifact.get("result_render") else ""
@@ -225,6 +237,14 @@ class ViewerWebServer:
         refinement_summary = (
             f'<p class="muted">Refinement status: {html.escape(str(refinement_status))}. {refined_view_button} {refined_asset_html}</p>'
             if refinement_status else ""
+        )
+        road_summary = (
+            f'<p class="muted">Road smoothing status: {html.escape(str(artifact.get("road_smoothing_status")))}. {road_asset_html}</p>'
+            if artifact.get("road_smoothing_status") else ""
+        )
+        building_summary = (
+            f'<p class="muted">Building regularization status: {html.escape(str(artifact.get("building_regularization_status")))}. {building_outputs_html}</p>'
+            if artifact.get("building_regularization_status") else ""
         )
         pose = artifact.get("camera_pose", {})
         page = ARTIFACT_PAGE_HTML.format(
@@ -247,7 +267,7 @@ class ViewerWebServer:
                 {"prompt": prompt, "detection_index": detection_index}
                 for prompt, detection_index, _detection in detection_entries
             ]),
-            refinement_summary=refinement_summary,
+            refinement_summary=refinement_summary + road_summary + building_summary,
         )
         data = page.encode("utf-8")
         handler.send_response(200)
@@ -278,7 +298,7 @@ button,select,input {{ border:1px solid var(--line); background:var(--panel); bo
 .dino-stage {{ position:relative; width:min(900px,100%); background:#080b10; }} .dino-stage img {{ display:block; width:100%; height:auto; }} .dino-stage canvas {{ position:absolute; inset:0; width:100%; height:100%; }}
 </style></head><body><main>
 <div class="head"><div><a href="/">&larr; All artifacts</a><h1>{title}</h1><div class="muted">{generator} &middot; {created_at}</div></div><div class="muted">yaw {yaw} &middot; pitch {pitch} &middot; distance {distance}</div></div>
-<p><button onclick="navigate()">Navigate display to this pose</button> <button onclick="segment()">Run / rerun SegFormer</button> <button onclick="mask2former()">Run / rerun Mask2Former</button> <button onclick="refineMesh()">Build refined mesh</button> <span id="status" class="status"></span></p>{refinement_summary}
+<p><button onclick="navigate()">Navigate display to this pose</button> <button onclick="segment()">Run / rerun SegFormer</button> <button onclick="mask2former()">Run / rerun Mask2Former</button> <button onclick="depthAnything()">Run / rerun Depth Anything on generated result</button> <button onclick="refineMesh()">Run / rerun mesh refinement</button> <button onclick="smoothRoad()">Smooth road from Mask2Former</button> <button onclick="regularizeBuildings()">Regularize buildings</button> <label for="buildingAggression">Aggression</label><input id="buildingAggression" type="range" min="0" max="1" step="0.05" value="0.5" oninput="document.getElementById('buildingAggressionValue').textContent=Number(this.value).toFixed(2)"><output id="buildingAggressionValue">0.50</output> <span id="status" class="status"></span></p>{refinement_summary}
 <h2>Artifact images</h2><div class="images">{images}</div>
 <h2>Compare images from this artifact</h2><div class="controls"><label for="imageA">Image A</label><select id="imageA" onchange="updateCompare()">{options}</select><label for="imageB">Image B</label><select id="imageB" onchange="updateCompare()">{options}</select></div>
 <div class="stage"><img id="bottom" src="/captures/{first_image}" alt="Image B"><img id="top" class="top" src="/captures/{second_image}" alt="Image A"><div id="divider" class="divider"></div></div><label for="slider">Swipe position</label><br><input id="slider" class="range" type="range" min="0" max="100" value="50" oninput="updateCompare()">
@@ -288,7 +308,10 @@ async function navigate() {{ const status=document.getElementById('status'); sta
 async function viewRefined() {{ const status=document.getElementById('status'); status.textContent='Loading refined texture...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'view_refined',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Refined texture loaded in viewer':data.error; }}
 async function segment() {{ const status=document.getElementById('status'); status.textContent='Starting SegFormer...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'segment',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'SegFormer started; refresh this page when complete':data.error; }}
 async function mask2former() {{ const status=document.getElementById('status'); status.textContent='Starting Mask2Former...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'mask2former',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Mask2Former started; refresh this page when complete':data.error; }}
+async function depthAnything() {{ const status=document.getElementById('status'); status.textContent='Starting Depth Anything on generated result...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'depth_anything',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Depth Anything started on generated result; refresh this page when complete':data.error; }}
 async function refineMesh() {{ const status=document.getElementById('status'); status.textContent='Starting mesh refinement...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'refine_mesh',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Mesh refinement started; refresh this page when complete':data.error; }}
+async function smoothRoad() {{ const status=document.getElementById('status'); status.textContent='Starting road smoothing...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'smooth_road',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Road smoothing started; refresh this page when complete':data.error; }}
+async function regularizeBuildings() {{ const status=document.getElementById('status'); const aggression=Number(document.getElementById('buildingAggression').value); status.textContent='Starting building regularization...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'regularize_buildings',index:{index},aggression:aggression}})}}); const data=await response.json(); status.textContent=data.ok?'Building regularization started; refresh this page when complete':data.error; }}
 async function groundingDino() {{ const status=document.getElementById('status'); status.textContent='Starting Grounding DINO...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'grounding_dino',index:{index},prompt:document.getElementById('dinoPrompt').value}})}}); const data=await response.json(); status.textContent=data.ok?'Grounding DINO started; refresh this page when complete':data.error; }}
 async function sam2All() {{ const status=document.getElementById('status'); status.textContent='Starting SAM2 for all boxes...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'sam2_all',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'SAM2 started for all boxes; refresh this page when complete':data.error; }}
 async function deleteDino(entryIndex) {{ const target=detectionTargets[entryIndex]; if(!target || !window.confirm('Delete this Grounding DINO detection?')) return; const status=document.getElementById('status'); status.textContent='Deleting detection...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'delete_dino_detection',index:{index},prompt:target.prompt,detection_index:target.detection_index}})}}); const data=await response.json(); if(data.ok) window.location.reload(); else status.textContent=data.error; }}

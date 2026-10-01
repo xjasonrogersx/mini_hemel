@@ -26,7 +26,18 @@ import trimesh
 from botocore.config import Config
 from PIL import Image, ImageOps
 from web_server import ViewerWebServer
-from mesh_refinement import project_points, project_scene_faces, sample_mask, visible_face_keys
+from mesh_refinement import (
+	load_relative_depth,
+	apply_conservative_geometry_refinement,
+	canny_edges,
+	regularize_masked_buildings,
+	smooth_masked_road,
+	project_points,
+	project_scene_faces,
+	sample_mask,
+	sample_relative_depth,
+	visible_face_keys,
+)
 
 
 ASSET_PATH = Path(__file__).with_name("merged.gltf")
@@ -275,6 +286,9 @@ class ModelWindow(pyglet.window.Window):
 			self.run_segmentation_for_artifact(int(command["index"]))
 		elif action == "mask2former":
 			self.run_mask2former_for_artifact(int(command["index"]))
+		elif action == "depth_anything":
+			LOGGER.info("Depth Anything web action dispatched: artifact=%s", command.get("index"))
+			self.run_depth_anything_for_artifact(int(command["index"]))
 		elif action == "grounding_dino":
 			self.run_grounding_dino_for_artifact(
 				int(command["index"]), str(command.get("prompt", "door"))
@@ -297,6 +311,12 @@ class ModelWindow(pyglet.window.Window):
 		elif action == "refine_mesh":
 			LOGGER.info("Mesh refinement web action dispatched: artifact=%s", command.get("index"))
 			self.run_mesh_refinement(int(command["index"]))
+		elif action == "smooth_road":
+			LOGGER.info("Road smoothing web action dispatched: artifact=%s", command.get("index"))
+			self.run_road_smoothing(int(command["index"]))
+		elif action == "regularize_buildings":
+			LOGGER.info("Building regularization web action dispatched: artifact=%s", command.get("index"))
+			self.run_building_regularization(int(command["index"]), float(command.get("aggression", 0.5)))
 		elif action == "set_options":
 			self.update_texture_options(command.get("options", {}))
 		else:
@@ -396,8 +416,192 @@ class ModelWindow(pyglet.window.Window):
 		).start()
 		self.set_caption(f"Mesh refinement started for artifact {index + 1}")
 
+	def run_road_smoothing(self, index: int) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		threading.Thread(
+			target=self._run_road_smoothing_worker,
+			args=(index,),
+			name=f"road-smoothing-{index}",
+			daemon=True,
+		).start()
+		self.set_caption(f"Road smoothing started for artifact {index + 1}")
+
+	def _run_road_smoothing_worker(self, index: int) -> None:
+		try:
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			artifact = artifacts[index]
+			road_names = [
+				str(name) for name in artifact.get("mask2former_masks", [])
+				if "mask2former_road" in str(name).lower()
+			]
+			if not road_names:
+				raise ValueError("artifact has no Mask2Former road segmentation image")
+			camera_pose = artifact.get("camera_pose", {})
+			capture_size = camera_pose.get("capture_size", {})
+			if "matrix" not in camera_pose or not capture_size:
+				raise ValueError("artifact is missing camera matrix or capture size")
+			loaded = trimesh.load(ASSET_PATH, file_type="gltf", force="scene")
+			if not isinstance(loaded, trimesh.Scene):
+				loaded = trimesh.Scene(loaded)
+			meshes = loaded.dump(concatenate=False)
+			face_records = project_scene_faces(loaded, camera_pose, capture_size)
+			road_masks = [
+				sample_mask(CAPTURES_PATH / name, face_records, capture_size)
+				for name in road_names
+				if (CAPTURES_PATH / name).is_file()
+			]
+			if not road_masks:
+				raise ValueError("Mask2Former road segmentation image does not exist")
+			changes = smooth_masked_road(meshes, road_masks)
+			if not changes:
+				raise ValueError("Mask2Former road mask selected no smoothable road vertices")
+			output_name = f"road_smoothed_{index}.gltf"
+			output_path = CAPTURES_PATH / output_name
+			trimesh.Scene(meshes).export(output_path, file_type="gltf")
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index]["road_smoothing_asset"] = output_name
+				artifacts[index]["road_smoothing_status"] = "smoothed"
+				artifacts[index]["road_smoothing_changes"] = changes
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			self.set_caption(f"Road smoothing saved: {output_name}")
+		except Exception as exc:
+			self.set_caption(f"Road smoothing failed: {exc}")
+			LOGGER.exception("Road smoothing failed for artifact %d", index)
+
+	def run_building_regularization(self, index: int, aggression: float = 0.5) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		threading.Thread(
+			target=self._run_building_regularization_worker,
+			args=(index, max(0.0, min(1.0, aggression))),
+			name=f"building-regularization-{index}",
+			daemon=True,
+		).start()
+		self.set_caption(f"Building regularization started for artifact {index + 1} (aggression {aggression:.2f})")
+
+	def _run_building_regularization_worker(self, index: int, aggression: float) -> None:
+		try:
+			LOGGER.info("Building regularization started: artifact=%d aggression=%.2f", index, aggression)
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			artifact = artifacts[index]
+			building_names = [
+				str(name) for name in artifact.get("mask2former_masks", [])
+				if "mask2former_building" in str(name).lower()
+			]
+			if not building_names:
+				raise ValueError("artifact has no Mask2Former building segmentation image")
+			LOGGER.info("Building regularization masks: artifact=%d files=%s", index, building_names)
+			image_name = artifact.get("result_render")
+			if not image_name:
+				raise ValueError("artifact has no generated result image for Canny edges")
+			image_path = CAPTURES_PATH / str(image_name)
+			if not image_path.is_file():
+				raise ValueError(f"generated result image does not exist: {image_name}")
+			camera_pose = artifact.get("camera_pose", {})
+			capture_size = camera_pose.get("capture_size", {})
+			if "matrix" not in camera_pose or not capture_size:
+				raise ValueError("artifact is missing camera matrix or capture size")
+			loaded = trimesh.load(ASSET_PATH, file_type="gltf", force="scene")
+			if not isinstance(loaded, trimesh.Scene):
+				loaded = trimesh.Scene(loaded)
+			meshes = loaded.dump(concatenate=False)
+			face_records = project_scene_faces(loaded, camera_pose, capture_size)
+			visible_keys = visible_face_keys(face_records, capture_size)
+			LOGGER.info("Building regularization projection: artifact=%d meshes=%d projected_faces=%d visible_faces=%d", index, len(meshes), len(face_records), len(visible_keys))
+			building_masks = [
+				sample_mask(CAPTURES_PATH / name, face_records, capture_size)
+				for name in building_names
+				if (CAPTURES_PATH / name).is_file()
+			]
+			if not building_masks:
+				raise ValueError("Mask2Former building segmentation image does not exist")
+			building_faces = {
+				(int(face[0]), int(face[1]))
+				for mask in building_masks
+				for face in mask.get("selected_faces", [])
+				if tuple(face) in visible_keys
+			}
+			LOGGER.info("Building regularization selection: artifact=%d mask_faces=%d visible_building_faces=%d", index, sum(mask.get("selected_count", 0) for mask in building_masks), len(building_faces))
+			edge_map, edge_metadata = canny_edges(image_path)
+			edge_name = f"building_canny_edges_{index}.png"
+			Image.fromarray(edge_map, mode="L").save(CAPTURES_PATH / edge_name)
+			LOGGER.info("Building regularization Canny: artifact=%d image=%s edge_file=%s edge_pixels=%d thresholds=(%.6f, %.6f)", index, image_path.name, edge_name, edge_metadata.get("edge_pixels", 0), edge_metadata.get("low_threshold", 0.0), edge_metadata.get("high_threshold", 0.0))
+			changes = regularize_masked_buildings(meshes, building_faces, face_records, edge_map, aggression=aggression)
+			if not changes:
+				raise ValueError("Mask2Former building mask selected no regularizable in-view polygons")
+			output_name = f"buildings_regularized_{index}.gltf"
+			trimesh.Scene(meshes).export(CAPTURES_PATH / output_name, file_type="gltf")
+			LOGGER.info("Building regularization geometry: artifact=%d aggression=%.2f components=%d changes=%s output=%s", index, aggression, len(changes), changes, output_name)
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index]["building_regularization_asset"] = output_name
+				artifacts[index]["building_regularization_edges"] = edge_name
+				artifacts[index]["building_regularization_edge_metadata"] = edge_metadata
+				artifacts[index]["building_regularization_aggression"] = aggression
+				artifacts[index]["building_regularization_status"] = "regularized"
+				artifacts[index]["building_regularization_changes"] = changes
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			self.set_caption(f"Building regularization saved: {output_name}")
+			LOGGER.info("Building regularization complete: artifact=%d status=regularized edge_file=%s mesh_file=%s", index, edge_name, output_name)
+		except Exception as exc:
+			self.set_caption(f"Building regularization failed: {exc}")
+			LOGGER.exception("Building regularization failed for artifact %d", index)
+
+	def run_depth_anything_for_artifact(self, index: int) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		artifact = artifacts[index]
+		image_name = artifact.get("result_render")
+		if not image_name:
+			raise ValueError("artifact has no generated result image")
+		image_path = CAPTURES_PATH / str(image_name)
+		if not image_path.is_file():
+			raise ValueError(f"generated result image does not exist: {image_name}")
+		LOGGER.info("Depth Anything rerun requested: artifact=%d source=%s bytes=%d", index, image_path.name, image_path.stat().st_size)
+		threading.Thread(
+			target=self._run_depth_anything_artifact_worker,
+			args=(index, image_path),
+			name=f"depth-anything-artifact-{index}", daemon=True,
+		).start()
+		self.set_caption(f"Depth Anything started for artifact {index + 1}")
+
+	def _run_depth_anything_artifact_worker(self, index: int, image_path: Path) -> None:
+		try:
+			started = time.monotonic()
+			self.set_caption(f"Depth Anything running for artifact {index + 1}")
+			depth_path = self._request_configured_depth(image_path)
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index]["generated_depth_render"] = depth_path.name
+				artifacts[index]["depth_anything_source"] = image_path.name
+				artifacts[index]["depth_anything_rerun_at"] = datetime.now().astimezone().isoformat()
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			LOGGER.info("Depth Anything artifact update complete: artifact=%d source=%s output=%s duration=%.2fs", index, image_path.name, depth_path.name, time.monotonic() - started)
+			self.set_caption(f"Depth Anything saved for artifact {index + 1}: {depth_path.name}")
+		except Exception as exc:
+			LOGGER.exception("Depth Anything artifact rerun failed: artifact=%d source=%s", index, image_path)
+			self.set_caption(f"Depth Anything failed for artifact {index + 1}: {exc}")
+
 	def _run_mesh_refinement_worker(self, index: int) -> None:
 		try:
+			started = time.monotonic()
+			LOGGER.info("Mesh refinement started: artifact=%d", index)
 			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
 				artifacts = json.load(artifacts_file)
 			artifact = artifacts[index]
@@ -409,6 +613,7 @@ class ModelWindow(pyglet.window.Window):
 			if "matrix" not in camera_pose or not capture_size:
 				raise ValueError("artifact is missing camera matrix or capture size")
 			meshes = loaded.dump(concatenate=False)
+			LOGGER.info("Mesh refinement loaded source: artifact=%d meshes=%d", index, len(meshes))
 			mesh_inventory = []
 			total_vertices = 0
 			total_faces = 0
@@ -427,26 +632,52 @@ class ModelWindow(pyglet.window.Window):
 			sidecar_name = f"refinement_{index}.json"
 			sidecar_path = CAPTURES_PATH / sidecar_name
 			refined_name = f"refined_{index}.gltf"
-			refined_bin_name = "merged.bin"
 			refined_path = CAPTURES_PATH / refined_name
-			shutil.copy2(ASSET_PATH, refined_path)
-			source_bin = ASSET_PATH.with_name(refined_bin_name)
-			if source_bin.is_file():
-				shutil.copy2(source_bin, refined_path.with_name(refined_bin_name))
 			source_hash = hashlib.sha256(ASSET_PATH.read_bytes()).hexdigest()
 			face_records = project_scene_faces(loaded, camera_pose, capture_size)
+			LOGGER.info("Mesh refinement projected faces: artifact=%d faces=%d", index, len(face_records))
+			depth_guidance = {"available": False, "relative_only": True}
+			depth_name = artifact.get("generated_depth_render")
+			if depth_name:
+				depth_path = CAPTURES_PATH / str(depth_name)
+				if depth_path.is_file():
+					depth_map, depth_metadata = load_relative_depth(depth_path, capture_size)
+					depth_guidance = {
+						"available": True,
+						**depth_metadata,
+						**sample_relative_depth(depth_map, face_records),
+					}
+					LOGGER.info("Mesh refinement loaded depth guidance: artifact=%d file=%s faces=%d", index, depth_name, depth_guidance.get("face_count", 0))
+				else:
+					LOGGER.warning("Mesh refinement depth file missing: artifact=%d file=%s", index, depth_path)
 			visible_faces = [
 				record for record in face_records
 				if record["in_front"] and record["in_frame"]
 			]
 			semantic_masks = []
-			for mask_name in artifact.get("mask2former_masks", []):
+			for mask_name in artifact.get("segmentation_masks", []) + artifact.get("mask2former_masks", []):
 				mask_path = CAPTURES_PATH / str(mask_name)
 				if mask_path.is_file():
 					semantic_masks.append(sample_mask(mask_path, face_records, capture_size))
+					LOGGER.info("Mesh refinement sampled mask: artifact=%d file=%s selected=%d", index, mask_name, semantic_masks[-1]["selected_count"])
+				else:
+					LOGGER.warning("Mesh refinement mask file missing: artifact=%d file=%s", index, mask_path)
+			visible_face_keys_set = visible_face_keys(face_records, capture_size)
+			geometry_changes = []
+			if depth_guidance.get("available"):
+				geometry_changes = apply_conservative_geometry_refinement(
+					meshes,
+					face_records,
+					semantic_masks,
+					depth_guidance,
+					visible_face_keys_set,
+				)
+			LOGGER.info("Mesh refinement geometry pass complete: artifact=%d changes=%d visible_faces=%d", index, len(geometry_changes), len(visible_face_keys_set))
+			refined_scene = trimesh.Scene(meshes)
+			refined_scene.export(refined_path, file_type="gltf")
 			sidecar = {
 				"version": 1,
-				"status": "projected",
+				"status": "refined" if geometry_changes else "depth_analyzed",
 				"source_asset": ASSET_PATH.name,
 				"source_asset_sha256": source_hash,
 				"refined_asset": refined_name,
@@ -475,7 +706,8 @@ class ModelWindow(pyglet.window.Window):
 					"faces": face_records,
 					"semantic_masks": semantic_masks,
 				},
-				"geometry_changes": [],
+				"depth_guidance": depth_guidance,
+				"geometry_changes": geometry_changes,
 			}
 			sidecar_path.write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
 			with ARTIFACTS_LOCK:
@@ -483,10 +715,11 @@ class ModelWindow(pyglet.window.Window):
 					artifacts = json.load(artifacts_file)
 				artifacts[index]["refinement_sidecar"] = sidecar_name
 				artifacts[index]["refined_asset"] = refined_name
-				artifacts[index]["refinement_status"] = "projected"
+				artifacts[index]["refinement_status"] = "refined" if geometry_changes else "depth_analyzed"
 				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
 					json.dump(artifacts, artifacts_file, indent=2)
-			self.set_caption(f"Mesh inventory saved: {total_faces} faces, {total_vertices} vertices")
+			LOGGER.info("Mesh refinement complete: artifact=%d status=%s duration=%.2fs output=%s", index, "refined" if geometry_changes else "depth_analyzed", time.monotonic() - started, refined_path)
+			self.set_caption(f"Mesh refinement saved: {total_faces} faces, {total_vertices} vertices")
 			LOGGER.info(
 				"Mesh refinement inventory saved: artifact=%d meshes=%d faces=%d vertices=%d sidecar=%s",
 				index, len(meshes), total_faces, total_vertices, sidecar_path,
@@ -1338,10 +1571,11 @@ class ModelWindow(pyglet.window.Window):
 		}
 		correlation_id = str(uuid.uuid4())
 		LOGGER.info(
-			"Sending generated texture to depth worker: model=%s queue=%s image=%s",
+			"Sending image to Depth Anything worker: model=%s queue=%s image=%s bytes=%d",
 			model,
 			queue,
 			image_path.name,
+			image_path.stat().st_size,
 		)
 		import pika
 		parameters = pika.URLParameters(rabbitmq_url)
@@ -1372,6 +1606,7 @@ class ModelWindow(pyglet.window.Window):
 		)
 		try:
 			deadline = time.monotonic() + float(depth_config.get("timeout", 300))
+			LOGGER.info("Depth Anything worker awaiting response: correlation_id=%s timeout=%ss", correlation_id, depth_config.get("timeout", 300))
 			while response is None:
 				remaining = deadline - time.monotonic()
 				if remaining <= 0:
@@ -1382,6 +1617,7 @@ class ModelWindow(pyglet.window.Window):
 			connection.close()
 
 		result = json.loads(response.decode("utf-8"))
+		LOGGER.info("Depth Anything worker response: ok=%s width=%s height=%s", result.get("ok"), result.get("width"), result.get("height"))
 		if not result.get("ok"):
 			raise RuntimeError(result.get("error", "Depth Anything worker failed"))
 		depth_base64 = result.get("depth_image_base64")
