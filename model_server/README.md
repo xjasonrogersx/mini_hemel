@@ -383,7 +383,8 @@ RABBITMQ_URL=amqp://guest:guest@172.17.0.1:5672/%2F python3 ../viewer.py
 ```
 
 Alternatively, run the worker and viewer on the same host as RabbitMQ and use
-the default `localhost` URL. Right-click in the viewer and choose ControlNet
+the default `localhost` URL. Press `R` in the viewer to choose the SDXL
+ControlNet path
 after the worker reports that it is waiting for requests. The generated image is saved in `captures/`. The worker
 logs the device, request settings, input modes, effective/requested iterations,
 and inference duration. A successful response includes the same metadata:
@@ -412,7 +413,7 @@ restarted after changing its code.
 
 ### SDXL ControlNet worker
 
-The viewer's `R` key, or the SDXL option in the left-click worker picker, uses
+The viewer's `R` key uses
 the `stable-diffusion-controlnet-sdxl` queue. This
 worker upgrades the ControlNet worker above to
 `stabilityai/stable-diffusion-xl-base-1.0` with

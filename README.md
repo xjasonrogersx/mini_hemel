@@ -68,7 +68,7 @@ The viewer currently uses **Google Earth-style orbit controls**.
 | Action | Control |
 | --- | --- |
 | Orbit / tilt | Shift + left mouse button drag |
-| New texture render | Right click, then choose a worker |
+| New texture render | Press `R` for SDXL or `T` for the configured generator |
 | Zoom | Scroll wheel |
 
 ### Comparison matrix
@@ -101,11 +101,11 @@ Walk mode uses basic Quake-style movement controls:
 
 The window title shows the current walk height in metres.
 
-## Texture worker picker
+## Texture workers
 
-Right-click in orbit mode and choose Stable Diffusion 1.5 ControlNet, SDXL
-ControlNet, or Flux depth ControlNet. The viewer saves the current RGB/depth
-pair and sends it to the selected RabbitMQ worker.
+Press `R` in orbit mode for SDXL ControlNet, or `T` for the configured texture
+generator. The viewer saves the current RGB/depth pair and sends it to the
+selected worker.
 
 For the Stable Diffusion 1.5 worker:
 
@@ -120,8 +120,8 @@ The generated image is saved in `captures/` as `view_controlnet_<timestamp>.png`
 
 ## SDXL textured renders
 
-Press `R` in the viewer for a direct SDXL render, or choose SDXL from the
-worker picker. This generates a higher quality textured render with SDXL and
+Press `R` in the viewer for a direct SDXL render. This generates a higher
+quality textured render with SDXL and
 the SDXL depth ControlNet. Start RabbitMQ and the worker before launching the
 viewer:
 
@@ -133,6 +133,14 @@ python3 viewer.py
 ```
 
 The generated image is saved in `captures/` as `view_sdxl_<timestamp>.png`.
+
+## Web control panel
+
+Starting `viewer.py` also starts a local control panel at
+`http://127.0.0.1:8765/`. It exposes display and camera modes, configured
+texture options, generation controls, and the entries in `artifacts.json`.
+Each artifact shows its captured and generated images; **Navigate display**
+restores the saved camera pose. Set `VIEWER_WEB_PORT` to use another port.
 
 ## Configured texture render
 

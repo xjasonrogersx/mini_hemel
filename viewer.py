@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import queue
 import requests
 import threading
 import time
@@ -17,12 +18,11 @@ import uuid
 import numpy as np
 import pyglet
 from pyglet import gl
-from pyglet import shapes
-from pyglet.text import Label
 import pyrender
 import trimesh
 from botocore.config import Config
 from PIL import Image, ImageOps
+from web_server import ViewerWebServer
 
 
 ASSET_PATH = Path(__file__).with_name("merged.gltf")
@@ -56,6 +56,8 @@ SDXL_STRENGTH = 0.45
 RABBITMQ_URL = os.getenv(
 	"RABBITMQ_URL", "amqp://guest:guest@localhost:5672/%2F"
 )
+WEB_HOST = os.getenv("VIEWER_WEB_HOST", "127.0.0.1")
+WEB_PORT = int(os.getenv("VIEWER_WEB_PORT", "8765"))
 LOGGER = logging.getLogger(__name__)
 
 
@@ -114,17 +116,125 @@ class ModelWindow(pyglet.window.Window):
 		self.walk_look_drag = False
 		self.walk_height = 0.0
 		self.last_click: tuple[float, int, int] | None = None
-		self.worker_menu: tuple[int, int] | None = None
-		self.worker_menu_items = (
-			("SD 1.5 ControlNet", "controlnet"),
-			("SDXL ControlNet", "sdxl"),
-			("Flux depth ControlNet", "flux"),
-			("Cancel", "cancel"),
-		)
 		self.color_buffer = np.zeros((WINDOW_HEIGHT, WINDOW_WIDTH, 4), dtype=np.uint8)
+		self.web_commands: queue.Queue[dict[str, object]] = queue.Queue()
+		self.web_server: ViewerWebServer | None = None
 		self.update_camera()
 		pyglet.clock.schedule_interval(self.render_frame, 1.0 / 60.0)
 		pyglet.clock.schedule_interval(self.update_walk, 1.0 / 60.0)
+		pyglet.clock.schedule_interval(self.process_web_commands, 1.0 / 30.0)
+
+	def web_state(self) -> dict[str, object]:
+		with CONFIG_PATH.open(encoding="utf-8") as config_file:
+			config = json.load(config_file)
+		texture_config = dict(config.get("texture_generator", {}))
+		texture_config.pop("key", None)
+		return {
+			"mode": self.mode,
+			"walk_mode": self.walk_mode,
+			"yaw": self.yaw,
+			"pitch": self.pitch,
+			"distance": self.distance,
+			"orbit_target": self.orbit_target.astype(float).tolist(),
+			"texture_generator": texture_config,
+		}
+
+	def enqueue_web_command(self, command: dict[str, object]) -> dict[str, object]:
+		completion = threading.Event()
+		result: dict[str, object] = {}
+		self.web_commands.put({"command": command, "completion": completion, "result": result})
+		if not completion.wait(timeout=5.0):
+			return {"ok": False, "error": "viewer did not process the command in time"}
+		return result
+
+	def process_web_commands(self, _delta_time: float) -> None:
+		while True:
+			try:
+				queued = self.web_commands.get_nowait()
+			except queue.Empty:
+				return
+			command = queued["command"]
+			completion = queued["completion"]
+			result = queued["result"]
+			try:
+				self.apply_web_command(command)
+				result.update({"ok": True})
+			except Exception as exc:
+				LOGGER.exception("Web viewer command failed: %s", command)
+				self.set_caption(f"Web command failed: {exc}")
+				result.update({"ok": False, "error": str(exc)})
+			finally:
+				completion.set()
+
+	def apply_web_command(self, command: dict[str, object]) -> None:
+		action = command.get("action")
+		if action == "set_mode":
+			mode = command.get("mode")
+			if mode not in {"textured", "depth"}:
+				raise ValueError("mode must be textured or depth")
+			self.mode = str(mode)
+			self.set_caption(f"merged.gltf | {self.mode}")
+		elif action == "set_navigation":
+			navigation_mode = command.get("mode")
+			if navigation_mode == "walk" and not self.walk_mode:
+				self.enter_walk_mode(self.width // 2, self.height // 2)
+			elif navigation_mode == "orbit" and self.walk_mode:
+				self.walk_mode = False
+				self.walk_keys.clear()
+				self.walk_look_drag = False
+				self.set_exclusive_mouse(False)
+				self.update_camera()
+				self.set_caption(f"merged.gltf | orbit | {self.mode}")
+		elif action == "generate":
+			generator = command.get("generator")
+			if generator == "sdxl":
+				self.generate_sdxl_view()
+			elif generator == "configured":
+				self.generate_configured_texture_view()
+			else:
+				raise ValueError("unsupported generator")
+		elif action == "save_view":
+			self.save_current_view()
+		elif action == "navigate":
+			self.navigate_to_artifact(int(command["index"]))
+		elif action == "set_options":
+			self.update_texture_options(command.get("options", {}))
+		else:
+			raise ValueError(f"unsupported web action: {action}")
+
+	def navigate_to_artifact(self, index: int) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		camera_pose = artifacts[index].get("camera_pose", {})
+		self.yaw = float(camera_pose["yaw"])
+		self.pitch = float(camera_pose["pitch"])
+		self.distance = float(camera_pose["distance"])
+		self.orbit_target = np.asarray(camera_pose["orbit_target"], dtype=np.float32)
+		if self.walk_mode:
+			self.walk_mode = False
+			self.walk_keys.clear()
+			self.walk_look_drag = False
+			self.set_exclusive_mouse(False)
+		self.update_camera()
+		self.set_caption(f"Navigated to artifact {index + 1}")
+
+	def update_texture_options(self, options: object) -> None:
+		if not isinstance(options, dict):
+			raise ValueError("options must be an object")
+		with CONFIG_PATH.open(encoding="utf-8") as config_file:
+			config = json.load(config_file)
+		texture_config = config.setdefault("texture_generator", {})
+		for key in ("prompt", "resolution", "aspect_ratio"):
+			if key in options:
+				texture_config[key] = str(options[key])
+		temporary_path = CONFIG_PATH.with_suffix(".json.tmp")
+		with temporary_path.open("w", encoding="utf-8") as config_file:
+			json.dump(config, config_file, indent=4)
+			config_file.write("\n")
+		temporary_path.replace(CONFIG_PATH)
+		self.set_caption("Texture options saved")
 
 	def update_camera(self) -> None:
 		center = self.orbit_target
@@ -171,34 +281,6 @@ class ModelWindow(pyglet.window.Window):
 			pitch=-self.width * 4,
 		)
 		image.blit(0, 0, width=self.width, height=self.height)
-		if self.worker_menu is not None:
-			self.draw_worker_menu()
-
-	def draw_worker_menu(self) -> None:
-		x, y = self.worker_menu
-		item_height = 34
-		menu_width = 230
-		menu_height = item_height * len(self.worker_menu_items)
-		menu_x = min(max(x, 8), max(8, self.width - menu_width - 8))
-		menu_y = min(max(y - menu_height, 8), max(8, self.height - menu_height - 8))
-		shapes.Rectangle(
-			menu_x, menu_y, menu_width, menu_height, color=(24, 30, 42)
-		).draw()
-		for index, (label, _worker) in enumerate(self.worker_menu_items):
-			item_y = menu_y + menu_height - (index + 1) * item_height
-			shapes.Rectangle(
-				menu_x + 2, item_y + 2, menu_width - 4, item_height - 4,
-				color=(42, 52, 70),
-			).draw()
-			Label(
-				label,
-				x=menu_x + 14,
-				y=item_y + 9,
-				font_name="Arial",
-				font_size=13,
-				color=(235, 240, 248, 255),
-			).draw()
-
 	def on_resize(self, width: int, height: int) -> None:
 		self.camera.aspectRatio = width / max(height, 1)
 		self.renderer.delete()
@@ -790,42 +872,11 @@ class ModelWindow(pyglet.window.Window):
 			if self.walk_mode:
 				self.walk_look_drag = not self.fullscreen
 				return
-			if self.worker_menu is not None:
-				self.select_worker_menu(x, y)
-				return
 			self.orbit_button = "orbit" if modifiers & pyglet.window.key.MOD_SHIFT else "pan"
 		elif button == pyglet.window.mouse.MIDDLE:
 			if self.walk_mode:
 				return
 			self.orbit_button = "orbit"
-		elif button == pyglet.window.mouse.RIGHT:
-			if not self.walk_mode:
-				self.worker_menu = (x, y)
-				self.set_caption("Select a worker for the new texture render")
-
-	def select_worker_menu(self, x: int, y: int) -> None:
-		menu_x, menu_y = self.worker_menu
-		item_height = 34
-		menu_width = 230
-		menu_height = item_height * len(self.worker_menu_items)
-		menu_x = min(max(menu_x, 8), max(8, self.width - menu_width - 8))
-		menu_y = min(max(menu_y - menu_height, 8), max(8, self.height - menu_height - 8))
-		if not (menu_x <= x <= menu_x + menu_width and menu_y <= y <= menu_y + menu_height):
-			self.worker_menu = None
-			return
-		index = int((y - menu_y) // item_height)
-		if index < 0 or index >= len(self.worker_menu_items):
-			self.worker_menu = None
-			return
-		_worker = self.worker_menu_items[len(self.worker_menu_items) - 1 - index][1]
-		self.worker_menu = None
-		if _worker == "controlnet":
-			self.generate_controlnet_view()
-		elif _worker == "sdxl":
-			self.generate_sdxl_view()
-		elif _worker == "flux":
-			self.generate_flux_view()
-
 	def on_mouse_release(self, _x: int, _y: int, button: int, _modifiers: int) -> None:
 		if button == pyglet.window.mouse.MIDDLE and self.walk_mode:
 			return
@@ -834,7 +885,6 @@ class ModelWindow(pyglet.window.Window):
 		if button in (
 			pyglet.window.mouse.LEFT,
 			pyglet.window.mouse.MIDDLE,
-			pyglet.window.mouse.RIGHT,
 		):
 			self.orbit_button = None
 
@@ -1077,8 +1127,23 @@ class ModelWindow(pyglet.window.Window):
 
 def main() -> None:
 	render_scene, camera = load_scene(ASSET_PATH)
-	ModelWindow(render_scene, camera)
-	pyglet.app.run()
+	window = ModelWindow(render_scene, camera)
+	web_server = ViewerWebServer(
+		CAPTURES_PATH,
+		ARTIFACTS_PATH,
+		window.web_state,
+		window.enqueue_web_command,
+		window.enqueue_web_command,
+		WEB_HOST,
+		WEB_PORT,
+	)
+	window.web_server = web_server
+	web_server.start()
+	LOGGER.info("Viewer control panel listening at http://%s:%d", WEB_HOST, WEB_PORT)
+	try:
+		pyglet.app.run()
+	finally:
+		web_server.stop()
 
 
 if __name__ == "__main__":
