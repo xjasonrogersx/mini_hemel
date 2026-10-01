@@ -7,3 +7,4 @@ model_server/sam2_b.pt
 model_server/test/result.png
 config.json
 artifacts.json
+model_server/test/depth_anything.png

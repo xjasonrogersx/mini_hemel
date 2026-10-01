@@ -218,6 +218,21 @@ class ModelWindow(pyglet.window.Window):
 			self.walk_look_drag = False
 			self.set_exclusive_mouse(False)
 		self.update_camera()
+		stored_matrix = camera_pose.get("matrix")
+		if stored_matrix is not None:
+			pose = np.asarray(stored_matrix, dtype=np.float32)
+			if pose.shape != (4, 4):
+				raise ValueError("artifact camera matrix must be 4x4")
+			self.render_scene.set_pose(self.render_scene._orbit_camera_node, pose)
+		LOGGER.info(
+			"Navigated to artifact index=%d yaw=%.6f pitch=%.6f distance=%.6f target=%s pose=%s",
+			index,
+			self.yaw,
+			self.pitch,
+			self.distance,
+			self.orbit_target.tolist(),
+			self.render_scene.get_pose(self.render_scene._orbit_camera_node).tolist(),
+		)
 		self.set_caption(f"Navigated to artifact {index + 1}")
 
 	def update_texture_options(self, options: object) -> None:

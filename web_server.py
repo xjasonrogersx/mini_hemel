@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
 from pathlib import Path
 import threading
 from typing import Any, Callable
@@ -12,6 +13,7 @@ from urllib.parse import unquote, urlparse
 
 WEB_HOST = "127.0.0.1"
 WEB_PORT = 8765
+LOGGER = logging.getLogger(__name__)
 
 
 class ViewerWebServer:
@@ -50,6 +52,7 @@ class ViewerWebServer:
                 data = json.dumps(payload).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
@@ -57,12 +60,14 @@ class ViewerWebServer:
             def _send_bytes(self, data: bytes, content_type: str) -> None:
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
 
             def do_GET(self) -> None:
                 parsed = urlparse(self.path)
+                LOGGER.info("Web GET %s", parsed.path)
                 if parsed.path in {"/", "/index.html"}:
                     self._send_bytes(CONTROL_PANEL_HTML.encode("utf-8"), "text/html; charset=utf-8")
                     return
@@ -95,13 +100,16 @@ class ViewerWebServer:
                     payload = json.loads(self.rfile.read(length).decode("utf-8"))
                     if not isinstance(payload, dict):
                         raise ValueError("request must be a JSON object")
+                    LOGGER.info("Web command received: %s", payload.get("action"))
                     if payload.get("action") == "set_options":
                         result = owner.config_callback(payload)
                     else:
                         result = owner.command_callback(payload)
                     if isinstance(result, dict) and not result.get("ok", True):
+                        LOGGER.warning("Web command failed: %s", result.get("error"))
                         self._send_json(result, 400)
                         return
+                    LOGGER.info("Web command completed: %s", payload.get("action"))
                     self._send_json(result if isinstance(result, dict) else {"ok": True})
                 except Exception as exc:
                     self._send_json({"ok": False, "error": str(exc)}, 400)
@@ -161,13 +169,13 @@ article { background:var(--panel); border:1px solid var(--line); border-radius:6
 <section class="toolbar">
  <div class="group"><label for="mode">Display</label><select id="mode"><option value="textured">Textured</option><option value="depth">Depth</option></select><button onclick="setMode()">Apply</button></div>
  <div class="group"><label for="navigation">Camera</label><select id="navigation"><option value="orbit">Orbit</option><option value="walk">Walk</option></select><button onclick="setNavigation()">Apply</button></div>
- <button class="primary" onclick="generate('configured')">Generate configured texture</button><button onclick="generate('sdxl')">Generate SDXL</button><button onclick="saveView()">Save view</button><button onclick="openCompare()">Compare artifacts</button>
+ <button class="primary" onclick="generate('configured')">Generate configured texture</button><button onclick="generate('sdxl')">Generate SDXL</button><button onclick="saveView()">Save view</button>
  <span class="status" id="status"></span>
 </section>
 <section><h2>Texture options</h2><div class="toolbar"><label for="prompt">Prompt</label><input id="prompt"><label for="resolution">Resolution</label><select id="resolution"><option>1k</option><option>2k</option><option>4k</option></select><label for="aspect">Aspect</label><select id="aspect"><option>4:3</option><option>16:9</option><option>1:1</option></select><button onclick="saveOptions()">Save options</button></div></section>
 <section><h2>Generated assets</h2><div class="assets" id="assets"><div class="empty">Loading artifacts...</div></div></section>
 </main>
-<div class="modal" id="compareModal" onclick="closeCompare(event)"><div class="dialog" onclick="event.stopPropagation()"><div class="dialog-head"><h2>Compare generated images</h2><button onclick="closeCompare()">Close</button></div><div class="compare-controls"><label for="compareA">Image A</label><select id="compareA" onchange="updateCompare()"></select><label for="compareB">Image B</label><select id="compareB" onchange="updateCompare()"></select></div><div class="compare-stage"><img id="compareBottom" alt="Image A"><img id="compareTop" class="compare-top" alt="Image B"><div id="compareDivider" class="compare-divider"></div></div><label for="compareSlider">Swipe position</label><input id="compareSlider" class="compare-range" type="range" min="0" max="100" value="50" oninput="updateCompare()"></div></div>
+<div class="modal" id="compareModal" onclick="closeCompare(event)"><div class="dialog" onclick="event.stopPropagation()"><div class="dialog-head"><h2 id="compareTitle">Compare artifact images</h2><button onclick="closeCompare()">Close</button></div><div class="compare-controls"><label for="compareA">Image A</label><select id="compareA" onchange="updateCompare()"></select><label for="compareB">Image B</label><select id="compareB" onchange="updateCompare()"></select></div><div class="compare-stage"><img id="compareBottom" alt="Image A"><img id="compareTop" class="compare-top" alt="Image B"><div id="compareDivider" class="compare-divider"></div></div><label for="compareSlider">Swipe position</label><input id="compareSlider" class="compare-range" type="range" min="0" max="100" value="50" oninput="updateCompare()"></div></div>
 <script>
 const $ = id => document.getElementById(id);
 async function post(body) { const r=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); const data=await r.json(); if(!data.ok) throw Error(data.error); return data; }
@@ -179,12 +187,14 @@ async function saveView(){ try { await post({action:'save_view'}); notice('View 
 async function saveOptions(){ try { await post({action:'set_options',options:{prompt:$('prompt').value,resolution:$('resolution').value,aspect_ratio:$('aspect').value}}); notice('Options saved'); } catch(e){notice(e.message)} }
 function image(name,label){ if(!name) return '<figure><div style="aspect-ratio:4/3"></div><figcaption>'+label+' unavailable</figcaption></figure>'; return '<figure><img loading="lazy" src="/captures/'+encodeURIComponent(name)+'" alt="'+label+'"><figcaption>'+name+'</figcaption></figure>'; }
 let artifacts=[];
-function renderAssets(items){ artifacts=items; const root=$('assets'); if(!items.length){root.innerHTML='<div class="empty">No artifact records yet.</div>';return;} root.innerHTML=items.slice().reverse().map((a,i)=>'<article><div class="meta"><strong>'+((a.generator||'generated')+' · '+(a.created_at||''))+'</strong><small>Camera yaw '+Number(a.camera_pose?.yaw||0).toFixed(3)+' · pitch '+Number(a.camera_pose?.pitch||0).toFixed(3)+' · distance '+Number(a.camera_pose?.distance||0).toFixed(2)+'</small></div><div class="images">'+image(a.texture_render,'Texture input')+image(a.result_render,'Generated result')+image(a.depth_render,'Renderer depth')+image(a.generated_depth_render,'Depth Anything')+'</div><div class="actions"><button class="primary" onclick="navigateAsset(${items.indexOf(a)})">Navigate display</button></div></article>').join(''); }
+let compareArtifact=null;
+function renderAssets(items){ artifacts=items; const root=$('assets'); if(!items.length){root.innerHTML='<div class="empty">No artifact records yet.</div>';return;} root.innerHTML=items.slice().reverse().map((a,i)=>'<article><div class="meta"><strong>'+((a.generator||'generated')+' · '+(a.created_at||''))+'</strong><small>Camera yaw '+Number(a.camera_pose?.yaw||0).toFixed(3)+' · pitch '+Number(a.camera_pose?.pitch||0).toFixed(3)+' · distance '+Number(a.camera_pose?.distance||0).toFixed(2)+'</small></div><div class="images">'+image(a.texture_render,'Texture input')+image(a.result_render,'Generated result')+image(a.depth_render,'Renderer depth')+image(a.generated_depth_render,'Depth Anything')+'</div><div class="actions"><button class="primary" onclick="navigateAsset('+items.indexOf(a)+')">Navigate display</button><button onclick="openCompare('+items.indexOf(a)+')">Compare images</button></div></article>').join(''); }
 async function navigateAsset(index){ try { await post({action:'navigate',index}); notice('Display moved to asset camera'); } catch(e){notice(e.message)} }
-function imageUrl(asset){ return asset.result_render||asset.texture_render||asset.generated_depth_render||asset.depth_render; }
-function openCompare(){ if(artifacts.length<2){notice('At least two artifacts are required');return;} const options=artifacts.map((a,i)=>'<option value="'+i+'">'+(i+1)+' · '+(a.result_render||a.texture_render||'artifact')+'</option>').join(''); $('compareA').innerHTML=options; $('compareB').innerHTML=options; $('compareB').value='1'; $('compareModal').classList.add('open'); updateCompare(); }
+function artifactImages(asset){ return [['texture_render','Texture input'],['result_render','Generated result'],['depth_render','Renderer depth'],['generated_depth_render','Depth Anything']].filter(item=>asset[item[0]]); }
+function imageUrl(asset, field){ return asset[field]; }
+function openCompare(index){ compareArtifact=artifacts[index]; if(!compareArtifact)return; const available=artifactImages(compareArtifact); if(available.length<2){notice('This artifact has fewer than two images');return;} const options=available.map(item=>'<option value="'+item[0]+'">'+item[1]+'</option>').join(''); $('compareA').innerHTML=options; $('compareB').innerHTML=options; $('compareB').value=available[1][0]; $('compareTitle').textContent='Compare artifact '+(index+1); $('compareModal').classList.add('open'); updateCompare(); }
 function closeCompare(event){ if(!event||event.target===$('compareModal')) $('compareModal').classList.remove('open'); }
-function updateCompare(){ const a=artifacts[Number($('compareA').value)], b=artifacts[Number($('compareB').value)]; if(!a||!b)return; const position=Number($('compareSlider').value); $('compareBottom').src='/captures/'+encodeURIComponent(imageUrl(a)); $('compareTop').src='/captures/'+encodeURIComponent(imageUrl(b)); $('compareTop').style.clipPath='inset(0 '+(100-position)+'% 0 0)'; $('compareDivider').style.left=position+'%'; }
+function updateCompare(){ if(!compareArtifact)return; const a=$('compareA').value, b=$('compareB').value; const position=Number($('compareSlider').value); $('compareBottom').src='/captures/'+encodeURIComponent(imageUrl(compareArtifact,a)); $('compareTop').src='/captures/'+encodeURIComponent(imageUrl(compareArtifact,b)); $('compareBottom').alt=a; $('compareTop').alt=b; $('compareTop').style.clipPath='inset(0 '+(100-position)+'% 0 0)'; $('compareDivider').style.left=position+'%'; }
 async function load(){ try { const [state,items]=await Promise.all([fetch('/api/state').then(r=>r.json()),fetch('/api/artifacts').then(r=>r.json())]); $('state').textContent=state.mode+' · '+(state.walk_mode?'walk':'orbit'); $('mode').value=state.mode; $('navigation').value=state.walk_mode?'walk':'orbit'; const t=state.texture_generator||{}; $('prompt').value=t.prompt||''; $('resolution').value=t.resolution||'1k'; $('aspect').value=t.aspect_ratio||'4:3'; renderAssets(items); } catch(e){$('state').textContent='Offline';} }
 load(); setInterval(load,5000);
 </script>
