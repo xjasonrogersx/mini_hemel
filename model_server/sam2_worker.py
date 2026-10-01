@@ -8,6 +8,7 @@ import base64
 import io
 import json
 import logging
+import time
 from typing import Any
 
 import numpy as np
@@ -41,13 +42,29 @@ class SAM2Worker:
         return base64.b64encode(output.getvalue()).decode("ascii")
 
     def process(self, request: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
+        LOGGER.info("SAM2 processing started")
         image = self._decode_image(request["image_base64"])
+        LOGGER.info(
+            "SAM2 image decoded: size=%sx%s",
+            image.shape[1],
+            image.shape[0],
+        )
         prediction_args: dict[str, Any] = {"source": image, "verbose": False}
         for field in ("points", "labels", "bboxes", "conf"):
             if field in request:
                 prediction_args[field] = request[field]
 
+        LOGGER.info(
+            "SAM2 inference started: fields=%s",
+            sorted(field for field in prediction_args if field != "source"),
+        )
         results = self.model.predict(**prediction_args)
+        LOGGER.info(
+            "SAM2 inference returned: result_count=%d duration=%.2fs",
+            len(results),
+            time.monotonic() - started,
+        )
         if not results:
             return {
                 "width": image.shape[1],
@@ -69,11 +86,17 @@ class SAM2Worker:
                     detection["class_id"] = int(boxes.cls[index].cpu())
             detections.append(detection)
 
-        return {
+        response = {
             "width": image.shape[1],
             "height": image.shape[0],
             "detections": detections,
         }
+        LOGGER.info(
+            "SAM2 processing completed: detections=%d duration=%.2fs",
+            len(detections),
+            time.monotonic() - started,
+        )
+        return response
 
     def run(self) -> None:
         connection = pika.BlockingConnection(pika.URLParameters(self.rabbitmq_url))
