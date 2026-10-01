@@ -4,6 +4,8 @@ from pathlib import Path
 from datetime import datetime
 import base64
 import boto3
+import copy
+import hashlib
 import io
 import json
 import logging
@@ -11,6 +13,7 @@ import math
 import os
 import queue
 import requests
+import shutil
 import threading
 import time
 import uuid
@@ -23,6 +26,7 @@ import trimesh
 from botocore.config import Config
 from PIL import Image, ImageOps
 from web_server import ViewerWebServer
+from mesh_refinement import project_points, project_scene_faces, sample_mask, visible_face_keys
 
 
 ASSET_PATH = Path(__file__).with_name("merged.gltf")
@@ -61,7 +65,11 @@ WEB_PORT = int(os.getenv("VIEWER_WEB_PORT", "8765"))
 LOGGER = logging.getLogger(__name__)
 
 
-def load_scene(asset_path: Path) -> tuple[pyrender.Scene, pyrender.PerspectiveCamera]:
+def load_scene(
+	asset_path: Path,
+	texture_path: Path | None = None,
+	camera_pose: dict[str, object] | None = None,
+) -> tuple[pyrender.Scene, pyrender.PerspectiveCamera]:
 	loaded = trimesh.load(asset_path, file_type="gltf", force="scene")
 	if not isinstance(loaded, trimesh.Scene):
 		loaded = trimesh.Scene(loaded)
@@ -76,12 +84,59 @@ def load_scene(asset_path: Path) -> tuple[pyrender.Scene, pyrender.PerspectiveCa
 		ambient_light=[1.0, 1.0, 1.0],
 	)
 	meshes = loaded.dump(concatenate=False)
+	if texture_path is not None:
+		if camera_pose is None or "matrix" not in camera_pose:
+			raise ValueError("camera pose is required for a view-projected texture")
+		capture_size = camera_pose.get("capture_size", {})
+		if not isinstance(capture_size, dict) or "width" not in capture_size or "height" not in capture_size:
+			raise ValueError("capture size is required for a view-projected texture")
+		texture = Image.open(texture_path).convert("RGB").resize(
+			(int(capture_size["width"]), int(capture_size["height"])),
+			resample=Image.Resampling.LANCZOS,
+		)
+		projection_records = project_scene_faces(loaded, camera_pose, capture_size)
+		visible_keys = visible_face_keys(projection_records, capture_size)
+		projected_meshes = []
+		for mesh_index, mesh in enumerate(meshes):
+			visible_faces = [
+				face_index for face_index in range(len(mesh.faces))
+				if (mesh_index, face_index) in visible_keys
+			]
+			occluded_faces = [
+				face_index for face_index in range(len(mesh.faces))
+				if (mesh_index, face_index) not in visible_keys
+			]
+			if occluded_faces:
+				projected_meshes.append(mesh.submesh([occluded_faces], append=True, repair=False))
+			if not visible_faces:
+				continue
+			visible_mesh = mesh.submesh([visible_faces], append=True, repair=False)
+			pixels, _depths = project_points(
+				np.asarray(visible_mesh.vertices), camera_pose["matrix"], capture_size
+			)
+			visible_mesh.visual.uv = np.column_stack((
+				np.clip(pixels[:, 0] / float(capture_size["width"]), 0.0, 1.0),
+				np.clip(1.0 - pixels[:, 1] / float(capture_size["height"]), 0.0, 1.0),
+			))
+			material = getattr(visible_mesh.visual, "material", None)
+			if material is not None and hasattr(material, "baseColorTexture"):
+				visible_mesh.visual.material = copy.deepcopy(material)
+				visible_mesh.visual.material.baseColorTexture = texture
+			projected_meshes.append(visible_mesh)
+		meshes = projected_meshes
+		render_scene._projected_visible_faces = len(visible_keys)
+		render_scene._projected_total_faces = sum(len(mesh.faces) for mesh in meshes)
 	render_scene.add(pyrender.Mesh.from_trimesh(meshes, smooth=False))
 	render_scene._walk_meshes = meshes
 
 	camera = pyrender.PerspectiveCamera(
 		yfov=math.radians(45.0),
-		aspectRatio=WINDOW_WIDTH / WINDOW_HEIGHT,
+		aspectRatio=(
+			float(camera_pose["capture_size"]["width"])
+			/ float(camera_pose["capture_size"]["height"])
+			if texture_path is not None and camera_pose is not None
+			else WINDOW_WIDTH / WINDOW_HEIGHT
+		),
 		znear=max(extent * CAMERA_NEAR_RATIO, 0.001),
 		zfar=extent * CAMERA_FAR_RATIO,
 	)
@@ -106,6 +161,9 @@ class ModelWindow(pyglet.window.Window):
 		self.camera = camera
 		self.renderer = pyrender.OffscreenRenderer(WINDOW_WIDTH, WINDOW_HEIGHT)
 		self.mode = "textured"
+		self.show_edges = False
+		self._edge_overlay = None
+		self._edge_cache_key = None
 		self.yaw = math.radians(35.0)
 		self.pitch = math.radians(18.0)
 		self.distance = render_scene._orbit_extent * 2.4
@@ -131,6 +189,7 @@ class ModelWindow(pyglet.window.Window):
 		texture_config.pop("key", None)
 		return {
 			"mode": self.mode,
+			"show_edges": self.show_edges,
 			"walk_mode": self.walk_mode,
 			"yaw": self.yaw,
 			"pitch": self.pitch,
@@ -184,6 +243,9 @@ class ModelWindow(pyglet.window.Window):
 				raise ValueError("mode must be textured or depth")
 			self.mode = str(mode)
 			self.set_caption(f"merged.gltf | {self.mode}")
+		elif action == "toggle_edges":
+			self.show_edges = not self.show_edges
+			self.set_caption(f"merged.gltf | edges {'on' if self.show_edges else 'off'}")
 		elif action == "set_navigation":
 			navigation_mode = command.get("mode")
 			if navigation_mode == "walk" and not self.walk_mode:
@@ -207,6 +269,8 @@ class ModelWindow(pyglet.window.Window):
 			self.save_current_view()
 		elif action == "navigate":
 			self.navigate_to_artifact(int(command["index"]))
+		elif action == "view_refined":
+			self.view_refined_artifact(int(command["index"]))
 		elif action == "segment":
 			self.run_segmentation_for_artifact(int(command["index"]))
 		elif action == "mask2former":
@@ -230,6 +294,9 @@ class ModelWindow(pyglet.window.Window):
 			self.delete_grounding_dino_detection(
 				int(command["index"]), str(command["prompt"]), int(command["detection_index"])
 			)
+		elif action == "refine_mesh":
+			LOGGER.info("Mesh refinement web action dispatched: artifact=%s", command.get("index"))
+			self.run_mesh_refinement(int(command["index"]))
 		elif action == "set_options":
 			self.update_texture_options(command.get("options", {}))
 		else:
@@ -268,6 +335,31 @@ class ModelWindow(pyglet.window.Window):
 		)
 		self.set_caption(f"Navigated to artifact {index + 1}")
 
+	def view_refined_artifact(self, index: int) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		artifact = artifacts[index]
+		asset_name = artifact.get("refined_asset")
+		texture_name = artifact.get("result_render")
+		if not asset_name or not texture_name:
+			raise ValueError("artifact has no refined asset and generated result texture")
+		asset_path = CAPTURES_PATH / str(asset_name)
+		texture_path = CAPTURES_PATH / str(texture_name)
+		if not asset_path.is_file() or not texture_path.is_file():
+			raise ValueError("refined asset or generated result texture does not exist")
+		new_scene, new_camera = load_scene(
+			asset_path, texture_path=texture_path, camera_pose=artifact.get("camera_pose")
+		)
+		self.render_scene = new_scene
+		self.camera = new_camera
+		self.orbit_target = new_scene._orbit_center.copy()
+		self.distance = new_scene._orbit_extent * 2.4
+		self.update_camera()
+		self.navigate_to_artifact(index)
+		self.set_caption(f"Refined texture viewed for artifact {index + 1}")
+
 	def delete_grounding_dino_detection(self, index: int, prompt: str, detection_index: int) -> None:
 		with ARTIFACTS_LOCK:
 			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
@@ -290,6 +382,118 @@ class ModelWindow(pyglet.window.Window):
 			with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
 				json.dump(artifacts, artifacts_file, indent=2)
 		self.set_caption(f"Deleted Grounding DINO {prompt} detection {detection_index + 1}")
+
+	def run_mesh_refinement(self, index: int) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		threading.Thread(
+			target=self._run_mesh_refinement_worker,
+			args=(index,),
+			name=f"mesh-refinement-{index}",
+			daemon=True,
+		).start()
+		self.set_caption(f"Mesh refinement started for artifact {index + 1}")
+
+	def _run_mesh_refinement_worker(self, index: int) -> None:
+		try:
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			artifact = artifacts[index]
+			loaded = trimesh.load(ASSET_PATH, file_type="gltf", force="scene")
+			if not isinstance(loaded, trimesh.Scene):
+				loaded = trimesh.Scene(loaded)
+			camera_pose = artifact.get("camera_pose", {})
+			capture_size = camera_pose.get("capture_size", {})
+			if "matrix" not in camera_pose or not capture_size:
+				raise ValueError("artifact is missing camera matrix or capture size")
+			meshes = loaded.dump(concatenate=False)
+			mesh_inventory = []
+			total_vertices = 0
+			total_faces = 0
+			for mesh_index, mesh in enumerate(meshes):
+				vertices = int(len(mesh.vertices))
+				faces = int(len(mesh.faces))
+				total_vertices += vertices
+				total_faces += faces
+				mesh_inventory.append({
+					"mesh_index": mesh_index,
+					"vertices": vertices,
+					"faces": faces,
+					"has_uv": bool(mesh.visual.uv is not None),
+					"bounds": np.asarray(mesh.bounds, dtype=float).tolist(),
+				})
+			sidecar_name = f"refinement_{index}.json"
+			sidecar_path = CAPTURES_PATH / sidecar_name
+			refined_name = f"refined_{index}.gltf"
+			refined_bin_name = "merged.bin"
+			refined_path = CAPTURES_PATH / refined_name
+			shutil.copy2(ASSET_PATH, refined_path)
+			source_bin = ASSET_PATH.with_name(refined_bin_name)
+			if source_bin.is_file():
+				shutil.copy2(source_bin, refined_path.with_name(refined_bin_name))
+			source_hash = hashlib.sha256(ASSET_PATH.read_bytes()).hexdigest()
+			face_records = project_scene_faces(loaded, camera_pose, capture_size)
+			visible_faces = [
+				record for record in face_records
+				if record["in_front"] and record["in_frame"]
+			]
+			semantic_masks = []
+			for mask_name in artifact.get("mask2former_masks", []):
+				mask_path = CAPTURES_PATH / str(mask_name)
+				if mask_path.is_file():
+					semantic_masks.append(sample_mask(mask_path, face_records, capture_size))
+			sidecar = {
+				"version": 1,
+				"status": "projected",
+				"source_asset": ASSET_PATH.name,
+				"source_asset_sha256": source_hash,
+				"refined_asset": refined_name,
+				"artifact_index": index,
+				"camera_pose": artifact.get("camera_pose", {}),
+				"source_images": {
+					"result_render": artifact.get("result_render"),
+					"depth_render": artifact.get("depth_render"),
+					"generated_depth_render": artifact.get("generated_depth_render"),
+				},
+				"annotations": {
+					"segmentation_masks": artifact.get("segmentation_masks", []),
+					"mask2former_masks": artifact.get("mask2former_masks", []),
+					"grounding_dino_detections": artifact.get("grounding_dino_detections", {}),
+				},
+				"mesh": {
+					"mesh_count": len(meshes),
+					"total_vertices": total_vertices,
+					"total_faces": total_faces,
+					"items": mesh_inventory,
+				},
+				"projection": {
+					"yfov_degrees": 45.0,
+					"face_count": len(face_records),
+					"visible_face_count": len(visible_faces),
+					"faces": face_records,
+					"semantic_masks": semantic_masks,
+				},
+				"geometry_changes": [],
+			}
+			sidecar_path.write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index]["refinement_sidecar"] = sidecar_name
+				artifacts[index]["refined_asset"] = refined_name
+				artifacts[index]["refinement_status"] = "projected"
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			self.set_caption(f"Mesh inventory saved: {total_faces} faces, {total_vertices} vertices")
+			LOGGER.info(
+				"Mesh refinement inventory saved: artifact=%d meshes=%d faces=%d vertices=%d sidecar=%s",
+				index, len(meshes), total_faces, total_vertices, sidecar_path,
+			)
+		except Exception as exc:
+			self.set_caption(f"Mesh refinement failed: {exc}")
+			LOGGER.exception("Mesh refinement failed for artifact %d", index)
 
 	def run_segmentation_for_artifact(self, index: int) -> None:
 		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
@@ -752,7 +956,31 @@ class ModelWindow(pyglet.window.Window):
 		else:
 			self.color_buffer, _ = self.renderer.render(self.render_scene, flags=flags)
 			self.color_buffer = self.color_buffer.copy()
+		if self.show_edges:
+			self.draw_triangle_edges()
 		self.invalid = True
+
+	def draw_triangle_edges(self) -> None:
+		"""Overlay pyrender's native wireframe pass in white."""
+		camera_pose = self.render_scene.get_pose(self.render_scene._orbit_camera_node)
+		cache_key = (
+			self.width,
+			self.height,
+			id(self.render_scene._walk_meshes),
+			tuple(np.round(camera_pose.ravel(), 6)),
+		)
+		if cache_key != self._edge_cache_key:
+			wire_color, _wire_depth = self.renderer.render(
+				self.render_scene,
+				flags=pyrender.RenderFlags.RGBA | pyrender.RenderFlags.ALL_WIREFRAME,
+			)
+			background = np.asarray(self.render_scene.bg_color[:3], dtype=np.float32) * 255.0
+			self._edge_overlay = np.max(
+				np.abs(wire_color[:, :, :3].astype(np.float32) - background), axis=2
+			) > 3.0
+			self._edge_cache_key = cache_key
+		if self._edge_overlay is not None:
+			self.color_buffer[self._edge_overlay, :3] = 255
 
 	def on_draw(self) -> None:
 		self.clear()
@@ -787,6 +1015,10 @@ class ModelWindow(pyglet.window.Window):
 		if symbol == pyglet.window.key.F:
 			self.set_fullscreen(not self.fullscreen)
 			self.set_exclusive_mouse(self.fullscreen and self.walk_mode)
+			return
+		if symbol == pyglet.window.key.E:
+			self.show_edges = not self.show_edges
+			self.set_caption(f"merged.gltf | edges {'on' if self.show_edges else 'off'}")
 			return
 		if symbol == pyglet.window.key.G and self.walk_mode:
 			self.walk_mode = False
