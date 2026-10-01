@@ -8,6 +8,7 @@ import base64
 import io
 import json
 import logging
+import time
 from typing import Any
 
 import numpy as np
@@ -47,6 +48,12 @@ class SegFormerWorker:
             self.dtype,
             len(self.id_to_label),
         )
+        LOGGER.info(
+            "SegFormer configuration: queue=%s rabbitmq_host=%s model=%s",
+            self.queue,
+            args.rabbitmq_url.split("@")[-1],
+            args.model,
+        )
 
     @staticmethod
     def _decode_image(image_base64: str) -> Image.Image:
@@ -74,7 +81,14 @@ class SegFormerWorker:
         return self._encode_png(Image.fromarray(colors[labels], mode="RGB"))
 
     def process(self, request: dict[str, Any]) -> dict[str, Any]:
+        started_at = time.monotonic()
+        LOGGER.info(
+            "SegFormer request started: keys=%s requested_classes=%s",
+            sorted(request),
+            request.get("classes", list(DEFAULT_CLASSES)),
+        )
         image = self._decode_image(request["image_base64"])
+        LOGGER.info("SegFormer image decoded: size=%sx%s mode=%s", image.width, image.height, image.mode)
         inputs = self.processor(images=image, return_tensors="pt")
         inputs = {
             key: value.to(device=self.device, dtype=self.dtype)
@@ -82,13 +96,24 @@ class SegFormerWorker:
             else value.to(self.device)
             for key, value in inputs.items()
         }
+        LOGGER.info(
+            "SegFormer inputs prepared: tensors=%s device=%s",
+            {key: tuple(value.shape) for key, value in inputs.items()},
+            self.device,
+        )
         with torch.inference_mode():
             outputs = self.model(**inputs)
+        LOGGER.info("SegFormer model inference completed")
         segmentation = self.processor.post_process_semantic_segmentation(
             outputs,
             target_sizes=[(image.height, image.width)],
         )[0]
         labels = segmentation.detach().cpu().numpy().astype(np.uint8)
+        LOGGER.info(
+            "SegFormer map postprocessed: shape=%s unique_labels=%d",
+            labels.shape,
+            len(np.unique(labels)),
+        )
 
         requested = request.get("classes", list(DEFAULT_CLASSES))
         if isinstance(requested, str):
@@ -122,7 +147,7 @@ class SegFormerWorker:
                 )
 
         present_ids = np.unique(labels)
-        return {
+        result = {
             "width": image.width,
             "height": image.height,
             "class_map": {str(class_id): label for class_id, label in self.id_to_label.items()},
@@ -134,22 +159,50 @@ class SegFormerWorker:
                 for class_id in present_ids
             ],
         }
+        LOGGER.info(
+            "SegFormer request completed: present_classes=%s masks=%d duration=%.2fs",
+            [item["label"] for item in result["present_classes"]],
+            len(result["masks"]),
+            time.monotonic() - started_at,
+        )
+        return result
 
     def run(self) -> None:
+        LOGGER.info(
+            "Connecting to RabbitMQ: host=%s queue=%s",
+            self.rabbitmq_url.split("@")[-1],
+            self.queue,
+        )
         connection = pika.BlockingConnection(pika.URLParameters(self.rabbitmq_url))
         channel = connection.channel()
         channel.queue_declare(queue=self.queue, durable=True)
         channel.basic_qos(prefetch_count=1)
+        LOGGER.info("RabbitMQ connection ready; prefetch_count=1")
 
         def on_request(
             channel: Any, method: Any, properties: Any, body: bytes
         ) -> None:
+            request_started = time.monotonic()
+            LOGGER.info(
+                "RabbitMQ request received: delivery_tag=%s correlation_id=%s reply_to=%s bytes=%d",
+                method.delivery_tag,
+                properties.correlation_id,
+                properties.reply_to,
+                len(body),
+            )
             try:
                 request = json.loads(body.decode("utf-8"))
                 response = {"ok": True, **self.process(request)}
             except Exception as exc:
                 LOGGER.exception("SegFormer request failed")
                 response = {"ok": False, "error": str(exc)}
+            LOGGER.info(
+                "RabbitMQ response sent: correlation_id=%s ok=%s bytes=%d duration=%.2fs",
+                properties.correlation_id,
+                response.get("ok"),
+                len(json.dumps(response).encode("utf-8")),
+                time.monotonic() - request_started,
+            )
             channel.basic_publish(
                 exchange="",
                 routing_key=properties.reply_to,
@@ -163,7 +216,12 @@ class SegFormerWorker:
 
         channel.basic_consume(queue=self.queue, on_message_callback=on_request)
         LOGGER.info("Waiting for SegFormer requests on queue %s", self.queue)
-        channel.start_consuming()
+        try:
+            channel.start_consuming()
+        finally:
+            LOGGER.info("Stopping SegFormer worker")
+            if not connection.is_closed:
+                connection.close()
 
 
 def main() -> None:

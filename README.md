@@ -158,7 +158,20 @@ temporary bucket objects. The R2 public base URL must be reachable by RunPod.
 <img width="1272" height="871" alt="image" src="https://github.com/user-attachments/assets/41105b23-0898-4469-a7eb-3b093284c871" />
 
 
+```
 python3 model_server/depth_anything_worker.py   --model depth-anything/Depth-Anything-V2-Small-hf   --rabbitmq-url amqp://guest:guest@192.168.1.220:5672/%2F
 
-python3 model_server/segformer_test.py    --rabbitmq-url amqp://guest:guest@192.168.1.220:5672/%2F
 
+
+```
+python3 model_server/segformer_worker.py   --model nvidia/segformer-b0-finetuned-ade-512-512   --queue segformer   --rabbitmq-url amqp://guest:guest@192.168.1.220:5672/%2F
+```
+
+It can segment categories such as:
+
+Buildings: building, house, wall, windowpane, door, roof, skyscraper
+Roads and terrain: road, sidewalk, grass, earth, sand, mountain, rock
+Vegetation: tree, plant, palm, flower, bush
+Vehicles: car, truck, bus, train, boat, airplane, bicycle, motorcycle
+Furniture/interior: chair, table, bed, sofa, cabinet, desk, shelf
+Objects: person, animal, sign, pole, lamp, fence, bridge, stairs

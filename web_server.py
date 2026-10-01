@@ -145,8 +145,15 @@ class ViewerWebServer:
             ("result_render", "Generated result"),
             ("depth_render", "Renderer depth"),
             ("generated_depth_render", "Depth Anything"),
+            ("segmentation_color_map", "SegFormer color map"),
+            ("segmentation_label_map", "SegFormer label map"),
         )
         available = [(field, label, artifact[field]) for field, label in image_fields if artifact.get(field)]
+        available.extend(
+            (f"segmentation_mask_{mask_index}", "SegFormer mask", filename)
+            for mask_index, filename in enumerate(artifact.get("segmentation_masks", []))
+            if filename
+        )
         options = "".join(
             f'<option value="{html.escape(field)}">{html.escape(label)}</option>'
             for field, label, _filename in available
@@ -198,12 +205,13 @@ button,select,input {{ border:1px solid var(--line); background:var(--panel); bo
 .controls {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:14px 0; }} .stage {{ position:relative; aspect-ratio:4/3; max-width:900px; background:#080b10; overflow:hidden; }} .stage img {{ position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }} .top {{ clip-path:inset(0 50% 0 0); }} .divider {{ position:absolute; top:0; bottom:0; left:50%; width:2px; background:var(--accent); pointer-events:none; }} .range {{ width:min(900px,100%); accent-color:var(--accent); }} .status {{ color:var(--cyan); }}
 </style></head><body><main>
 <div class="head"><div><a href="/">&larr; All artifacts</a><h1>{title}</h1><div class="muted">{generator} &middot; {created_at}</div></div><div class="muted">yaw {yaw} &middot; pitch {pitch} &middot; distance {distance}</div></div>
-<p><button onclick="navigate()">Navigate display to this pose</button> <span id="status" class="status"></span></p>
+<p><button onclick="navigate()">Navigate display to this pose</button> <button onclick="segment()">Run / rerun SegFormer</button> <span id="status" class="status"></span></p>
 <h2>Artifact images</h2><div class="images">{images}</div>
 <h2>Compare images from this artifact</h2><div class="controls"><label for="imageA">Image A</label><select id="imageA" onchange="updateCompare()">{options}</select><label for="imageB">Image B</label><select id="imageB" onchange="updateCompare()">{options}</select></div>
 <div class="stage"><img id="bottom" src="/captures/{first_image}" alt="Image A"><img id="top" class="top" src="/captures/{second_image}" alt="Image B"><div id="divider" class="divider"></div></div><label for="slider">Swipe position</label><br><input id="slider" class="range" type="range" min="0" max="100" value="50" oninput="updateCompare()">
 <script>
 async function navigate() {{ const status=document.getElementById('status'); status.textContent='Navigating...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'navigate',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Display moved to this pose':data.error; }}
+async function segment() {{ const status=document.getElementById('status'); status.textContent='Starting SegFormer...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'segment',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'SegFormer started; refresh this page when complete':data.error; }}
 function updateCompare() {{ const a=document.getElementById('imageA').value,b=document.getElementById('imageB').value,p=Number(document.getElementById('slider').value); const fields={fields}; document.getElementById('bottom').src='/captures/'+encodeURIComponent(fields[a]); document.getElementById('top').src='/captures/'+encodeURIComponent(fields[b]); document.getElementById('top').style.clipPath='inset(0 '+(100-p)+'% 0 0)'; document.getElementById('divider').style.left=p+'%'; }}
 </script></main></body></html>"""
 
