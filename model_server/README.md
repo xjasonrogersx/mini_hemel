@@ -13,6 +13,8 @@ The workers use separate queues so they can run independently:
 | ControlNet (SD 1.5 + depth) | `controlnet_worker.py` | `stable-diffusion-controlnet` | Generated PNG |
 | SDXL ControlNet (SDXL + depth) | `sdxl_worker.py` | `stable-diffusion-controlnet-sdxl` | Generated PNG |
 | Flux ControlNet (Flux + depth) | `flux_controlnet_worker.py` | `flux-controlnet-depth` | Generated PNG |
+| Depth Anything V2 | `depth_anything_worker.py` | `depth-anything` | 16-bit depth PNG |
+| SegFormer ADE20K | `segformer_worker.py` | `segformer` | Semantic label map and masks |
 | Ultralytics SAM3 | `sam3_worker.py` | `sam3` | Detection metadata and masks |
 | Ultralytics SAM2 | `sam2_worker.py` | `sam2` | Detection metadata and masks |
 
@@ -34,6 +36,91 @@ python3 flux_controlnet_worker.py \
 
 The raw XLabs checkpoint cannot be passed directly to Diffusers 0.40.0 because
 that version has no single-file loader for `FluxControlNetModel`.
+
+### SegFormer semantic segmentation
+
+`segformer_worker.py` uses `nvidia/segformer-b0-finetuned-ade-512-512`, whose
+ADE20K labels include `tree`, `windowpane`, `door`, `road`, and `sidewalk`.
+The worker returns a complete label map and color visualization, plus binary
+masks for requested classes. The request can use `street`; it is mapped to the
+ADE20K `road` class.
+
+```bash
+python3 segformer_worker.py \
+	--model nvidia/segformer-b0-finetuned-ade-512-512 \
+	--queue segformer \
+	--rabbitmq-url amqp://guest:guest@HOST:5672/%2F
+```
+
+Request body:
+
+```json
+{
+	"image_base64": "<PNG bytes encoded as base64>",
+	"classes": ["tree", "window", "door", "street", "sidewalk"]
+}
+```
+
+Each returned mask includes `class_id`, `pixel_count`, `bbox_xyxy`, and a
+`mask_base64` grayscale PNG. The response also includes
+`label_map_base64`, `color_map_base64`, `class_map`, and `present_classes`.
+
+Run the bundled test using the `segmentation_generator` settings from the
+root `config.json`:
+
+```bash
+python3 segformer_test.py
+```
+
+Results are written to `model_server/test/segformer_output/`. Override the
+input image or requested classes with `--image` and `--classes`.
+
+### Depth Anything V2
+
+`depth_anything_worker.py` uses the Transformers implementation of Depth
+Anything V2. The default checkpoint is the small Hugging Face model, which is
+appropriate for a shared GPU worker. Start it with:
+
+```bash
+python3 depth_anything_worker.py \
+	--model depth-anything/Depth-Anything-V2-Small-hf \
+	--queue depth-anything \
+	--rabbitmq-url amqp://guest:guest@HOST:5672/%2F
+```
+
+With the worker running, send the bundled test image through RabbitMQ:
+
+```bash
+python3 depth_anything_test.py \
+	--rabbitmq-url amqp://guest:guest@HOST:5672/%2F
+```
+
+The request contains an RGB image:
+
+```json
+{
+	"image_base64": "<PNG bytes encoded as base64>"
+}
+```
+
+Successful responses contain a normalized 16-bit PNG depth image. Larger
+values represent larger model-predicted depth values:
+
+```json
+{
+	"ok": true,
+	"width": 800,
+	"height": 600,
+	"depth_image_base64": "<16-bit PNG bytes encoded as base64>",
+	"depth_min": 0,
+	"depth_max": 65535
+}
+```
+
+When the viewer uses the configured `runpod_nano_banana_2` texture generator,
+it automatically sends the returned texture image to this worker. The generated
+depth image is saved in `captures/` and referenced by `generated_depth_render`
+in `artifacts.json`.
 
 ## RabbitMQ message format
 

@@ -5,4 +5,6 @@ trimesh
 networkx>=2.8
 Pillow
 pika
+torch
+transformers
 

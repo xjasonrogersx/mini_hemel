@@ -421,9 +421,19 @@ class ModelWindow(pyglet.window.Window):
 			output_path = self._request_runpod_nano_banana(
 				view_path, depth_path, texture_config
 			)
-			self.append_artifact(view_path, depth_path, output_path, camera_pose, texture_config)
+			generated_depth_path = self._request_configured_depth(output_path)
+			self.append_artifact(
+				view_path,
+				depth_path,
+				output_path,
+				generated_depth_path,
+				camera_pose,
+				texture_config,
+			)
 			LOGGER.info("Configured texture completed: output=%s bytes=%d", output_path, output_path.stat().st_size)
-			self.set_caption(f"Configured texture saved: {output_path.name}")
+			self.set_caption(
+				f"Configured texture and depth saved: {output_path.name}, {generated_depth_path.name}"
+			)
 		except Exception as exc:
 			LOGGER.exception("Configured texture request failed")
 			self.set_caption(f"Configured texture failed: {exc}")
@@ -516,11 +526,92 @@ class ModelWindow(pyglet.window.Window):
 				except Exception:
 					LOGGER.warning("Could not delete temporary R2 object %s", key, exc_info=True)
 
+	@staticmethod
+	def _request_configured_depth(image_path: Path) -> Path:
+		with CONFIG_PATH.open(encoding="utf-8") as config_file:
+			config = json.load(config_file)
+		depth_config = config.get("depth_generator")
+		if not isinstance(depth_config, dict):
+			raise ValueError("config.json is missing depth_generator")
+		if not depth_config.get("rabbitmq_url"):
+			raise ValueError("depth_generator.rabbitmq_url is required")
+		queue = depth_config.get("queue", "depth-anything")
+		model = depth_config.get("model", "depth-anything/Depth-Anything-V2")
+		request = {
+			"image_base64": base64.b64encode(image_path.read_bytes()).decode("ascii"),
+		}
+		correlation_id = str(uuid.uuid4())
+		LOGGER.info(
+			"Sending generated texture to depth worker: model=%s queue=%s image=%s",
+			model,
+			queue,
+			image_path.name,
+		)
+		import pika
+		parameters = pika.URLParameters(depth_config["rabbitmq_url"])
+		parameters.heartbeat = 0
+		connection = pika.BlockingConnection(parameters)
+		channel = connection.channel()
+		channel.queue_declare(queue=queue, durable=True)
+		reply_queue = channel.queue_declare(queue="", exclusive=True).method.queue
+		response: bytes | None = None
+
+		def on_response(_channel, _method, properties, body: bytes) -> None:
+			nonlocal response
+			if properties.correlation_id == correlation_id:
+				response = body
+
+		consumer_tag = channel.basic_consume(
+			queue=reply_queue, on_message_callback=on_response, auto_ack=True
+		)
+		channel.basic_publish(
+			exchange="",
+			routing_key=queue,
+			body=json.dumps(request).encode("utf-8"),
+			properties=pika.BasicProperties(
+				content_type="application/json",
+				correlation_id=correlation_id,
+				reply_to=reply_queue,
+			),
+		)
+		try:
+			deadline = time.monotonic() + float(depth_config.get("timeout", 300))
+			while response is None:
+				remaining = deadline - time.monotonic()
+				if remaining <= 0:
+					raise TimeoutError("Depth Anything worker response timed out")
+				connection.process_data_events(time_limit=min(1.0, remaining))
+		finally:
+			channel.basic_cancel(consumer_tag)
+			connection.close()
+
+		result = json.loads(response.decode("utf-8"))
+		if not result.get("ok"):
+			raise RuntimeError(result.get("error", "Depth Anything worker failed"))
+		depth_base64 = result.get("depth_image_base64")
+		if not depth_base64:
+			raise RuntimeError("Depth Anything response did not contain depth_image_base64")
+		depth_path = CAPTURES_PATH / (
+			f"depth_anything_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+		)
+		depth_path.write_bytes(base64.b64decode(depth_base64))
+		LOGGER.info(
+			"Generated depth saved: path=%s bytes=%d size=%sx%s range=%s..%s",
+			depth_path,
+			depth_path.stat().st_size,
+			result.get("width", "?"),
+			result.get("height", "?"),
+			result.get("depth_min", "?"),
+			result.get("depth_max", "?"),
+		)
+		return depth_path
+
 	def append_artifact(
 		self,
 		view_path: Path,
 		depth_path: Path,
 		output_path: Path,
+		generated_depth_path: Path,
 		camera_pose: dict[str, object],
 		texture_config: dict[str, str],
 	) -> None:
@@ -537,6 +628,7 @@ class ModelWindow(pyglet.window.Window):
 					"created_at": datetime.now().astimezone().isoformat(),
 					"generator": texture_config.get("model"),
 					"depth_render": depth_path.name,
+					"generated_depth_render": generated_depth_path.name,
 					"texture_render": view_path.name,
 					"result_render": output_path.name,
 					"camera_pose": camera_pose,
