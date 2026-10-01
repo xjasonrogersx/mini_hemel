@@ -194,6 +194,10 @@ python3 model_server/grounding_dino_worker.py \
   --queue grounding-dino \
   --rabbitmq-url amqp://guest:guest@192.168.1.220:5672/%2F
 
+
+
+pip uninstall opencv-python opencv-contrib-python
+pip install opencv-python-headless
 python3 model_server/sam2_worker.py \
   --model sam2_b.pt \
   --queue sam2 \
