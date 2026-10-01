@@ -86,6 +86,11 @@ class SAM2Worker:
         ) -> None:
             try:
                 request = json.loads(body.decode("utf-8"))
+                LOGGER.info(
+                    "SAM2 work received: correlation_id=%s fields=%s",
+                    properties.correlation_id,
+                    sorted(field for field in ("points", "labels", "bboxes", "conf") if field in request),
+                )
                 response = {"ok": True, **self.process(request)}
             except Exception as exc:
                 LOGGER.exception("SAM2 request failed")

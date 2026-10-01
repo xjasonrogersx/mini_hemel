@@ -157,6 +157,7 @@ class ModelWindow(pyglet.window.Window):
 			completion = queued["completion"]
 			result = queued["result"]
 			try:
+				LOGGER.info("Viewer web command received: action=%s", command.get("action"))
 				self.apply_web_command(command)
 				result.update({"ok": True})
 			except Exception as exc:
@@ -201,6 +202,18 @@ class ModelWindow(pyglet.window.Window):
 			self.run_segmentation_for_artifact(int(command["index"]))
 		elif action == "mask2former":
 			self.run_mask2former_for_artifact(int(command["index"]))
+		elif action == "grounding_dino":
+			self.run_grounding_dino_for_artifact(
+				int(command["index"]), str(command.get("prompt", "door"))
+			)
+		elif action == "sam2_box":
+			LOGGER.info(
+				"SAM2 web action dispatched: artifact=%s prompt=%r detection_index=%s",
+				command.get("index"), command.get("prompt"), command.get("detection_index"),
+			)
+			self.run_sam2_for_artifact_box(
+				int(command["index"]), str(command["prompt"]), int(command["detection_index"])
+			)
 		elif action == "set_options":
 			self.update_texture_options(command.get("options", {}))
 		else:
@@ -433,6 +446,152 @@ class ModelWindow(pyglet.window.Window):
 		except Exception as exc:
 			self.set_caption(f"Mask2Former failed for artifact {index + 1}: {exc}")
 			LOGGER.exception("Mask2Former failed for artifact %d", index)
+
+	def run_grounding_dino_for_artifact(self, index: int, prompt: str) -> None:
+		image_path = self._artifact_image_path(index)
+		if not prompt.strip():
+			raise ValueError("Grounding DINO prompt must not be empty")
+		threading.Thread(
+			target=self._run_grounding_dino_worker,
+			args=(index, image_path, prompt),
+			name=f"grounding-dino-{index}", daemon=True,
+		).start()
+		self.set_caption(f"Grounding DINO started for artifact {index + 1}: {prompt}")
+
+	def run_sam2_for_artifact_box(self, index: int, prompt: str, detection_index: int) -> None:
+		image_path = self._artifact_image_path(index)
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		try:
+			stored = artifacts[index]["grounding_dino_detections"]
+			if isinstance(stored, list):
+				legacy_detections = stored
+				stored = {}
+				for item in legacy_detections:
+					item_prompt = str(item.get("prompt") or item.get("label") or "legacy").strip().lower().rstrip(".,;:!? ")
+					stored.setdefault(item_prompt, []).append(item)
+			detections = stored[prompt]
+			detection = detections[detection_index]
+			box = detection["box_xyxy"]
+		except (IndexError, KeyError, TypeError):
+			raise ValueError("Grounding DINO detection is not available")
+		threading.Thread(
+			target=self._run_sam2_box_worker,
+			args=(index, prompt, detection_index, image_path, box),
+			name=f"sam2-box-{index}-{prompt}-{detection_index}", daemon=True,
+		).start()
+		self.set_caption(f"SAM2 started for artifact {index + 1} {prompt} box {detection_index + 1}")
+
+	def _artifact_image_path(self, index: int) -> Path:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		image_name = artifacts[index].get("result_render") or artifacts[index].get("texture_render")
+		if not image_name:
+			raise ValueError("artifact has no image to process")
+		image_path = CAPTURES_PATH / image_name
+		if not image_path.is_file():
+			raise ValueError(f"artifact image does not exist: {image_name}")
+		return image_path
+
+	def _rabbitmq_request(self, settings: dict, queue_name: str, request: dict) -> dict:
+		import pika
+		correlation_id = str(uuid.uuid4())
+		parameters = pika.URLParameters(settings["rabbitmq_url"])
+		parameters.heartbeat = 0
+		connection = pika.BlockingConnection(parameters)
+		channel = connection.channel()
+		channel.queue_declare(queue=queue_name, durable=True)
+		reply_queue = channel.queue_declare(queue="", exclusive=True).method.queue
+		response: bytes | None = None
+
+		def on_response(_channel, _method, properties, body: bytes) -> None:
+			nonlocal response
+			if properties.correlation_id == correlation_id:
+				response = body
+
+		consumer_tag = channel.basic_consume(queue=reply_queue, on_message_callback=on_response, auto_ack=True)
+		LOGGER.info(
+			"Model work sent: queue=%s correlation_id=%s fields=%s",
+			queue_name,
+			correlation_id,
+			sorted(request),
+		)
+		channel.basic_publish(
+			exchange="", routing_key=queue_name, body=json.dumps(request).encode("utf-8"),
+			properties=pika.BasicProperties(content_type="application/json", correlation_id=correlation_id, reply_to=reply_queue),
+		)
+		try:
+			deadline = time.monotonic() + float(settings.get("timeout", 300))
+			while response is None:
+				remaining = deadline - time.monotonic()
+				if remaining <= 0:
+					raise TimeoutError(f"Worker response timed out on queue {queue_name}")
+				connection.process_data_events(time_limit=min(1.0, remaining))
+		finally:
+			channel.basic_cancel(consumer_tag)
+			connection.close()
+		result = json.loads(response.decode("utf-8"))
+		if not result.get("ok"):
+			raise RuntimeError(result.get("error", f"Worker failed on queue {queue_name}"))
+		return result
+
+	def _run_grounding_dino_worker(self, index: int, image_path: Path, prompt: str) -> None:
+		try:
+			with CONFIG_PATH.open(encoding="utf-8") as config_file:
+				settings = json.load(config_file).get("grounding_dino_generator", {})
+			if not isinstance(settings, dict) or not settings.get("rabbitmq_url"):
+				raise ValueError("config.json is missing grounding_dino_generator.rabbitmq_url")
+			result = self._rabbitmq_request(settings, settings.get("queue", "grounding-dino"), {
+				"image_base64": base64.b64encode(image_path.read_bytes()).decode("ascii"),
+				"text_prompt": prompt,
+				"threshold": settings.get("threshold", 0.35),
+				"text_threshold": settings.get("text_threshold", 0.25),
+			})
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				prompt_key = prompt.strip().lower().rstrip(".,;:!? ")
+				stored = artifacts[index].setdefault("grounding_dino_detections", {})
+				if isinstance(stored, list):
+					stored = {"legacy": stored}
+					artifacts[index]["grounding_dino_detections"] = stored
+				stored[prompt_key] = result.get("detections", [])
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			self.set_caption(f"Grounding DINO found {len(result.get('detections', []))} box(es)")
+		except Exception as exc:
+			self.set_caption(f"Grounding DINO failed: {exc}")
+			LOGGER.exception("Grounding DINO failed for artifact %d", index)
+
+	def _run_sam2_box_worker(self, index: int, prompt: str, detection_index: int, image_path: Path, box: list) -> None:
+		try:
+			with CONFIG_PATH.open(encoding="utf-8") as config_file:
+				settings = json.load(config_file).get("sam2_generator", {})
+			if not isinstance(settings, dict) or not settings.get("rabbitmq_url"):
+				raise ValueError("config.json is missing sam2_generator.rabbitmq_url")
+			result = self._rabbitmq_request(settings, settings.get("queue", "sam2"), {
+				"image_base64": base64.b64encode(image_path.read_bytes()).decode("ascii"),
+				"bboxes": [box],
+			})
+			detections = result.get("detections", [])
+			if not detections or not detections[0].get("mask_base64"):
+				raise RuntimeError("SAM2 returned no mask for the selected box")
+			stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+			filename = f"sam2_dino_box_{detection_index}_{stamp}.png"
+			(CAPTURES_PATH / filename).write_bytes(base64.b64decode(detections[0]["mask_base64"]))
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				box_record = artifacts[index]["grounding_dino_detections"][prompt][detection_index]
+				box_record["sam2_mask"] = filename
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			self.set_caption(f"SAM2 mask saved for {prompt} box {detection_index + 1}")
+		except Exception as exc:
+			self.set_caption(f"SAM2 failed for {prompt} box {detection_index + 1}: {exc}")
+			LOGGER.exception("SAM2 failed for artifact %d prompt %s box %d", index, prompt, detection_index)
 
 	def update_texture_options(self, options: object) -> None:
 		if not isinstance(options, dict):

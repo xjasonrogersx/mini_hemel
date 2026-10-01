@@ -16,6 +16,7 @@ The workers use separate queues so they can run independently:
 | Depth Anything V2 | `depth_anything_worker.py` | `depth-anything` | 16-bit depth PNG |
 | SegFormer ADE20K | `segformer_worker.py` | `segformer` | Semantic label map and masks |
 | Mask2Former ADE20K | `mask2former_worker.py` | `mask2former` | Semantic label map and masks |
+| Grounding DINO | `grounding_dino_worker.py` | `grounding-dino` | Text-prompted bounding boxes |
 | Ultralytics SAM3 | `sam3_worker.py` | `sam3` | Detection metadata and masks |
 | Ultralytics SAM2 | `sam2_worker.py` | `sam2` | Detection metadata and masks |
 
@@ -688,4 +689,18 @@ and generated images are saved in the viewer's `captures/` directory.
 	or use a smaller diffusion model.
 - The viewer times out: check that the worker reached the waiting message and
 	that both sides use the same queue and RabbitMQ URL.
-add
+
+```
+python3 model_server/grounding_dino_worker.py \
+  --model IDEA-Research/grounding-dino-tiny \
+  --queue grounding-dino \
+  --rabbitmq-url amqp://guest:guest@192.168.1.220:5672/%2F
+```
+
+
+```
+python3 model_server/sam2_worker.py \
+  --model sam2_b.pt \
+  --queue sam2 \
+  --rabbitmq-url amqp://guest:guest@192.168.1.220:5672/%2F
+```

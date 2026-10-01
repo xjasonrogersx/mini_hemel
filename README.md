@@ -185,3 +185,17 @@ python3 model_server/mask2former_worker.py \
   --queue mask2former \
   --rabbitmq-url amqp://guest:guest@192.168.1.220:5672/%2F
   ```
+
+Grounding DINO detection and per-box SAM2 masks:
+
+```bash
+python3 model_server/grounding_dino_worker.py \
+  --model IDEA-Research/grounding-dino-tiny \
+  --queue grounding-dino \
+  --rabbitmq-url amqp://guest:guest@192.168.1.220:5672/%2F
+
+python3 model_server/sam2_worker.py \
+  --model sam2_b.pt \
+  --queue sam2 \
+  --rabbitmq-url amqp://guest:guest@192.168.1.220:5672/%2F
+```
