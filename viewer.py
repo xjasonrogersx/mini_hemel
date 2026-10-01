@@ -199,6 +199,8 @@ class ModelWindow(pyglet.window.Window):
 			self.navigate_to_artifact(int(command["index"]))
 		elif action == "segment":
 			self.run_segmentation_for_artifact(int(command["index"]))
+		elif action == "mask2former":
+			self.run_mask2former_for_artifact(int(command["index"]))
 		elif action == "set_options":
 			self.update_texture_options(command.get("options", {}))
 		else:
@@ -339,6 +341,98 @@ class ModelWindow(pyglet.window.Window):
 		except Exception as exc:
 			self.set_caption(f"SegFormer failed for artifact {index + 1}: {exc}")
 			LOGGER.exception("SegFormer failed for artifact %d", index)
+
+	def run_mask2former_for_artifact(self, index: int) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		artifact = artifacts[index]
+		image_name = artifact.get("result_render") or artifact.get("texture_render")
+		if not image_name:
+			raise ValueError("artifact has no image to segment")
+		image_path = CAPTURES_PATH / image_name
+		if not image_path.is_file():
+			raise ValueError(f"artifact image does not exist: {image_name}")
+		threading.Thread(
+			target=self._run_mask2former_worker,
+			args=(index, image_path),
+			name=f"mask2former-{index}",
+			daemon=True,
+		).start()
+		self.set_caption(f"Mask2Former started for artifact {index + 1}")
+
+	def _run_mask2former_worker(self, index: int, image_path: Path) -> None:
+		try:
+			with CONFIG_PATH.open(encoding="utf-8") as config_file:
+				config = json.load(config_file)
+			settings = config.get("mask2former_generator", {})
+			if not isinstance(settings, dict) or not settings.get("rabbitmq_url"):
+				raise ValueError("config.json is missing mask2former_generator.rabbitmq_url")
+			request = {
+				"image_base64": base64.b64encode(image_path.read_bytes()).decode("ascii"),
+				"classes": settings.get("classes", []),
+			}
+			import pika
+			correlation_id = str(uuid.uuid4())
+			parameters = pika.URLParameters(settings["rabbitmq_url"])
+			parameters.heartbeat = 0
+			connection = pika.BlockingConnection(parameters)
+			channel = connection.channel()
+			queue_name = settings.get("queue", "mask2former")
+			channel.queue_declare(queue=queue_name, durable=True)
+			reply_queue = channel.queue_declare(queue="", exclusive=True).method.queue
+			response: bytes | None = None
+
+			def on_response(_channel, _method, properties, body: bytes) -> None:
+				nonlocal response
+				if properties.correlation_id == correlation_id:
+					response = body
+
+			consumer_tag = channel.basic_consume(queue=reply_queue, on_message_callback=on_response, auto_ack=True)
+			channel.basic_publish(
+				exchange="", routing_key=queue_name, body=json.dumps(request).encode("utf-8"),
+				properties=pika.BasicProperties(content_type="application/json", correlation_id=correlation_id, reply_to=reply_queue),
+			)
+			try:
+				deadline = time.monotonic() + float(settings.get("timeout", 300))
+				while response is None:
+					remaining = deadline - time.monotonic()
+					if remaining <= 0:
+						raise TimeoutError("Mask2Former worker response timed out")
+					connection.process_data_events(time_limit=min(1.0, remaining))
+			finally:
+				channel.basic_cancel(consumer_tag)
+				connection.close()
+			result = json.loads(response.decode("utf-8"))
+			if not result.get("ok"):
+				raise RuntimeError(result.get("error", "Mask2Former worker failed"))
+			stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+			outputs = {}
+			for field, prefix in (("color_map_base64", "mask2former_color_map"), ("label_map_base64", "mask2former_label_map")):
+				encoded = result.get(field)
+				if not encoded:
+					raise RuntimeError(f"Mask2Former response did not contain {field}")
+				filename = f"{prefix}_{stamp}.png"
+				(CAPTURES_PATH / filename).write_bytes(base64.b64decode(encoded))
+				outputs[field] = filename
+			for mask in result.get("masks", []):
+				label = "".join(character if character.isalnum() or character in "_-" else "_" for character in str(mask.get("label", "class")))
+				filename = f"mask2former_{label}_{stamp}.png"
+				(CAPTURES_PATH / filename).write_bytes(base64.b64decode(mask["mask_base64"]))
+				outputs.setdefault("masks", []).append(filename)
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index]["mask2former_color_map"] = outputs["color_map_base64"]
+				artifacts[index]["mask2former_label_map"] = outputs["label_map_base64"]
+				artifacts[index]["mask2former_masks"] = outputs.get("masks", [])
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			self.set_caption(f"Mask2Former completed for artifact {index + 1}")
+		except Exception as exc:
+			self.set_caption(f"Mask2Former failed for artifact {index + 1}: {exc}")
+			LOGGER.exception("Mask2Former failed for artifact %d", index)
 
 	def update_texture_options(self, options: object) -> None:
 		if not isinstance(options, dict):

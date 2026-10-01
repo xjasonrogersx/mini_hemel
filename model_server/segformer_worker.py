@@ -19,7 +19,7 @@ from transformers import AutoImageProcessor, SegformerForSemanticSegmentation
 
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_CLASSES = ("tree", "window", "door", "road", "street", "sidewalk")
+DEFAULT_CLASSES = ("building", "wall", "house", "roof", "window", "door", "tree", "street", "sidewalk")
 CLASS_ALIASES = {"street": "road", "windows": "windowpane", "window": "windowpane"}
 
 

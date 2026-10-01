@@ -15,6 +15,7 @@ The workers use separate queues so they can run independently:
 | Flux ControlNet (Flux + depth) | `flux_controlnet_worker.py` | `flux-controlnet-depth` | Generated PNG |
 | Depth Anything V2 | `depth_anything_worker.py` | `depth-anything` | 16-bit depth PNG |
 | SegFormer ADE20K | `segformer_worker.py` | `segformer` | Semantic label map and masks |
+| Mask2Former ADE20K | `mask2former_worker.py` | `mask2former` | Semantic label map and masks |
 | Ultralytics SAM3 | `sam3_worker.py` | `sam3` | Detection metadata and masks |
 | Ultralytics SAM2 | `sam2_worker.py` | `sam2` | Detection metadata and masks |
 
@@ -57,7 +58,7 @@ Request body:
 ```json
 {
 	"image_base64": "<PNG bytes encoded as base64>",
-	"classes": ["tree", "window", "door", "street", "sidewalk"]
+	"classes": ["building", "wall", "house", "roof", "window", "door", "tree", "street", "sidewalk"]
 }
 ```
 
