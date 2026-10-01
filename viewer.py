@@ -223,6 +223,13 @@ class ModelWindow(pyglet.window.Window):
 			self.run_sam2_for_artifact_box(
 				int(command["index"]), str(command["prompt"]), int(command["detection_index"])
 			)
+		elif action == "sam2_all":
+			LOGGER.info("SAM2 all-boxes web action dispatched: artifact=%s", command.get("index"))
+			self.run_sam2_for_all_artifact_boxes(int(command["index"]))
+		elif action == "delete_dino_detection":
+			self.delete_grounding_dino_detection(
+				int(command["index"]), str(command["prompt"]), int(command["detection_index"])
+			)
 		elif action == "set_options":
 			self.update_texture_options(command.get("options", {}))
 		else:
@@ -260,6 +267,29 @@ class ModelWindow(pyglet.window.Window):
 			self.render_scene.get_pose(self.render_scene._orbit_camera_node).tolist(),
 		)
 		self.set_caption(f"Navigated to artifact {index + 1}")
+
+	def delete_grounding_dino_detection(self, index: int, prompt: str, detection_index: int) -> None:
+		with ARTIFACTS_LOCK:
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			try:
+				stored = artifacts[index].get("grounding_dino_detections", {})
+				if isinstance(stored, list):
+					grouped = {}
+					for item in stored:
+						item_prompt = str(item.get("prompt") or item.get("label") or "legacy").strip().lower().rstrip(".,;:!? ")
+						grouped.setdefault(item_prompt, []).append(item)
+					stored = grouped
+					artifacts[index]["grounding_dino_detections"] = stored
+				group = stored[prompt]
+				group.pop(detection_index)
+				if not group:
+					del stored[prompt]
+			except (IndexError, KeyError, TypeError, AttributeError):
+				raise ValueError("Grounding DINO detection is not available")
+			with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+				json.dump(artifacts, artifacts_file, indent=2)
+		self.set_caption(f"Deleted Grounding DINO {prompt} detection {detection_index + 1}")
 
 	def run_segmentation_for_artifact(self, index: int) -> None:
 		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
@@ -488,6 +518,40 @@ class ModelWindow(pyglet.window.Window):
 		).start()
 		self.set_caption(f"SAM2 started for artifact {index + 1} {prompt} box {detection_index + 1}")
 
+	def run_sam2_for_all_artifact_boxes(self, index: int) -> None:
+		image_path = self._artifact_image_path(index)
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		try:
+			stored = artifacts[index].get("grounding_dino_detections", {})
+			if isinstance(stored, list):
+				grouped = {}
+				for item in stored:
+					item_prompt = str(item.get("prompt") or item.get("label") or "legacy").strip().lower().rstrip(".,;:!? ")
+					grouped.setdefault(item_prompt, []).append(item)
+				stored = grouped
+				artifacts[index]["grounding_dino_detections"] = stored
+				with ARTIFACTS_LOCK:
+					with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+						json.dump(artifacts, artifacts_file, indent=2)
+			entries = [
+				(prompt, detection_index, detection)
+				for prompt, detections in stored.items()
+				for detection_index, detection in enumerate(detections)
+				if isinstance(detection, dict) and detection.get("box_xyxy")
+			]
+			if not entries:
+				raise ValueError("Grounding DINO has no boxes for this artifact")
+			boxes = [entry[2]["box_xyxy"] for entry in entries]
+		except (IndexError, KeyError, TypeError, AttributeError):
+			raise ValueError("Grounding DINO detections are not available")
+		threading.Thread(
+			target=self._run_sam2_all_worker,
+			args=(index, image_path, entries, boxes),
+			name=f"sam2-all-{index}", daemon=True,
+		).start()
+		self.set_caption(f"SAM2 started for {len(boxes)} boxes on artifact {index + 1}")
+
 	def _artifact_image_path(self, index: int) -> Path:
 		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
 			artifacts = json.load(artifacts_file)
@@ -602,6 +666,42 @@ class ModelWindow(pyglet.window.Window):
 		except Exception as exc:
 			self.set_caption(f"SAM2 failed for {prompt} box {detection_index + 1}: {exc}")
 			LOGGER.exception("SAM2 failed for artifact %d prompt %s box %d", index, prompt, detection_index)
+
+	def _run_sam2_all_worker(self, index: int, image_path: Path, entries: list, boxes: list) -> None:
+		try:
+			with CONFIG_PATH.open(encoding="utf-8") as config_file:
+				config = json.load(config_file)
+				settings = config.get("sam2_generator", {})
+				rabbitmq_url = self._rabbitmq_url(config, "sam2_generator", settings)
+				settings = dict(settings)
+				settings["rabbitmq_url"] = rabbitmq_url
+			result = self._rabbitmq_request(settings, settings.get("queue", "sam2"), {
+				"image_base64": base64.b64encode(image_path.read_bytes()).decode("ascii"),
+				"bboxes": boxes,
+			})
+			detections = result.get("detections", [])
+			if len(detections) != len(entries):
+				raise RuntimeError(f"SAM2 returned {len(detections)} masks for {len(entries)} boxes")
+			stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+			mask_files = []
+			for mask_index, detection in enumerate(detections):
+				if not detection.get("mask_base64"):
+					raise RuntimeError(f"SAM2 returned no mask for box {mask_index + 1}")
+				filename = f"sam2_dino_box_all_{mask_index}_{stamp}.png"
+				(CAPTURES_PATH / filename).write_bytes(base64.b64decode(detection["mask_base64"]))
+				mask_files.append(filename)
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				stored = artifacts[index]["grounding_dino_detections"]
+				for (prompt, detection_index, _), filename in zip(entries, mask_files):
+					stored[prompt][detection_index]["sam2_mask"] = filename
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			self.set_caption(f"SAM2 masks saved for {len(mask_files)} boxes")
+		except Exception as exc:
+			self.set_caption(f"SAM2 all-boxes failed: {exc}")
+			LOGGER.exception("SAM2 all-boxes failed for artifact %d", index)
 
 	def update_texture_options(self, options: object) -> None:
 		if not isinstance(options, dict):
