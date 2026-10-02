@@ -219,9 +219,10 @@ class ViewerWebServer:
             f'<button onclick="viewRefined()">View refined texture</button>'
             if refined_asset and artifact.get("result_render") else ""
         )
-        refinement_summary = (
-            f'<p class="muted">Refinement status: {html.escape(str(refinement_status))}. {refined_view_button}</p>'
-            if refinement_status else ""
+        refinement_section = (
+            f'<section class="operation"><h2>Mesh refinement</h2>'
+            f'<p id="refinementStatus" class="muted">Refinement status: {html.escape(str(refinement_status or "not started"))}</p>'
+            f'<p><button onclick="refineMesh()">Run / rerun mesh refinement</button> {refined_view_button}</p></section>'
         )
         road_result = artifact.get("road_smoothing_asset")
         building_result = artifact.get("building_regularization_asset")
@@ -256,7 +257,7 @@ class ViewerWebServer:
                 {"prompt": prompt, "detection_index": detection_index}
                 for prompt, detection_index, _detection in detection_entries
             ]),
-            refinement_summary=refinement_summary + road_section + building_section,
+            refinement_summary=refinement_section + road_section + building_section,
         )
         data = page.encode("utf-8")
         handler.send_response(200)
@@ -288,7 +289,7 @@ button,select,input {{ border:1px solid var(--line); background:var(--panel); bo
 .operation {{ margin:18px 0; padding:16px; background:var(--panel); border:1px solid var(--line); border-left:3px solid var(--accent); border-radius:6px; }} .operation h2 {{ margin:0 0 8px; }} .operation .range {{ width:min(420px,100%); vertical-align:middle; }} .operation output {{ display:inline-block; min-width:3em; color:var(--cyan); }}
 </style></head><body><main>
 <div class="head"><div><a href="/">&larr; All artifacts</a><h1>{title}</h1><div class="muted">{generator} &middot; {created_at}</div></div><div class="muted">yaw {yaw} &middot; pitch {pitch} &middot; distance {distance}</div></div>
-<p><button onclick="navigate()">Navigate display to this pose</button> <button onclick="segment()">Run / rerun SegFormer</button> <button onclick="mask2former()">Run / rerun Mask2Former</button> <button onclick="depthAnything()">Run / rerun Depth Anything on generated result</button> <button onclick="refineMesh()">Run / rerun mesh refinement</button> <span id="status" class="status"></span></p>{refinement_summary}
+<p><button onclick="navigate()">Navigate display to this pose</button> <button onclick="segment()">Run / rerun SegFormer</button> <button onclick="mask2former()">Run / rerun Mask2Former</button> <button onclick="depthAnything()">Run / rerun Depth Anything on generated result</button> <span id="status" class="status"></span></p>{refinement_summary}
 <h2>Artifact images</h2><div class="images">{images}</div>
 <h2>Compare images from this artifact</h2><div class="controls"><label for="imageA">Image A</label><select id="imageA" onchange="updateCompare()">{options}</select><label for="imageB">Image B</label><select id="imageB" onchange="updateCompare()">{options}</select></div>
 <div class="stage"><img id="bottom" src="/captures/{first_image}" alt="Image B"><img id="top" class="top" src="/captures/{second_image}" alt="Image A"><div id="divider" class="divider"></div></div><label for="slider">Swipe position</label><br><input id="slider" class="range" type="range" min="0" max="100" value="50" oninput="updateCompare()">
@@ -302,7 +303,7 @@ async function segment() {{ const status=document.getElementById('status'); stat
 async function mask2former() {{ const status=document.getElementById('status'); status.textContent='Starting Mask2Former...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'mask2former',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Mask2Former started; refresh this page when complete':data.error; }}
 async function runMlsd() {{ const status=document.getElementById('status'); status.textContent='Starting M-LSD...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'mlsd',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'M-LSD started; refresh this page when complete':data.error; }}
 async function depthAnything() {{ const status=document.getElementById('status'); status.textContent='Starting Depth Anything on generated result...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'depth_anything',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Depth Anything started on generated result; refresh this page when complete':data.error; }}
-async function refineMesh() {{ const status=document.getElementById('status'); status.textContent='Starting mesh refinement...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'refine_mesh',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Mesh refinement started; refresh this page when complete':data.error; }}
+async function refineMesh() {{ const status=document.getElementById('refinementStatus'); status.textContent='Refinement status: starting...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'refine_mesh',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Refinement status: started; refresh this page when complete':'Refinement status: '+data.error; }}
 async function smoothRoad() {{ const status=document.getElementById('status'); status.textContent='Starting road smoothing...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'smooth_road',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Road smoothing started; refresh this page when complete':data.error; }}
 async function regularizeBuildings() {{ const status=document.getElementById('status'); const aggression=Number(document.getElementById('buildingAggression').value); status.textContent='Starting building regularization...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'regularize_buildings',index:{index},aggression:aggression}})}}); const data=await response.json(); status.textContent=data.ok?'Building regularization started; refresh this page when complete':data.error; }}
 async function groundingDino() {{ const status=document.getElementById('status'); status.textContent='Starting Grounding DINO...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'grounding_dino',index:{index},prompt:document.getElementById('dinoPrompt').value}})}}); const data=await response.json(); status.textContent=data.ok?'Grounding DINO started; refresh this page when complete':data.error; }}
