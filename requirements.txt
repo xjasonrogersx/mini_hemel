@@ -4,6 +4,7 @@ pyrender==0.1.45
 trimesh
 networkx>=2.8
 Pillow
+opencv-python-headless
 pika
 torch
 transformers

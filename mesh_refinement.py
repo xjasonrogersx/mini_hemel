@@ -426,73 +426,11 @@ def smooth_masked_road(
     return changes
 
 
-def canny_edges(image_path: Path, low_ratio: float = 0.10, high_ratio: float = 0.25) -> tuple[np.ndarray, dict[str, Any]]:
-    """Return a binary Canny edge map without requiring an external image package."""
-    with Image.open(image_path) as image:
-        gray = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
-    gaussian = np.asarray([1.0, 4.0, 6.0, 4.0, 1.0], dtype=np.float32) / 16.0
-    blurred = _convolve_axis(_convolve_axis(gray, gaussian, axis=0), gaussian, axis=1)
-    gradient_x = _convolve_axis(blurred, np.asarray([-1.0, 0.0, 1.0]), axis=1)
-    gradient_y = _convolve_axis(blurred, np.asarray([-1.0, 0.0, 1.0]), axis=0)
-    magnitude = np.hypot(gradient_x, gradient_y)
-    angle = (np.rad2deg(np.arctan2(gradient_y, gradient_x)) + 180.0) % 180.0
-    nms = np.zeros_like(magnitude)
-    for first, second, lower, upper in (
-        (0, 22.5, 0, 1), (22.5, 67.5, 1, 2), (67.5, 112.5, 2, 3),
-        (112.5, 157.5, 3, 2), (157.5, 180, 0, 1),
-    ):
-        selected = (angle >= first) & (angle < second)
-        first_neighbor = np.roll(magnitude, lower, axis=1)
-        second_neighbor = np.roll(magnitude, -lower, axis=1)
-        if upper != lower:
-            first_neighbor = np.roll(first_neighbor, 1, axis=0)
-            second_neighbor = np.roll(second_neighbor, -1, axis=0)
-        nms[selected & (magnitude >= first_neighbor) & (magnitude >= second_neighbor)] = magnitude[selected & (magnitude >= first_neighbor) & (magnitude >= second_neighbor)]
-    nonzero = nms[nms > 0]
-    if len(nonzero) == 0:
-        return np.zeros_like(nms, dtype=np.uint8), {"width": int(gray.shape[1]), "height": int(gray.shape[0]), "edge_pixels": 0}
-    low = float(np.quantile(nonzero, low_ratio))
-    high = float(np.quantile(nonzero, high_ratio))
-    strong = nms >= high
-    weak = (nms >= low) & ~strong
-    edges = strong.copy()
-    while True:
-        connected = np.zeros_like(edges)
-        for row_shift in (-1, 0, 1):
-            for column_shift in (-1, 0, 1):
-                if row_shift or column_shift:
-                    connected |= np.roll(np.roll(edges, row_shift, axis=0), column_shift, axis=1)
-        new_edges = edges | (weak & connected)
-        if np.array_equal(new_edges, edges):
-            break
-        edges = new_edges
-    edges[[0, -1], :] = False
-    edges[:, [0, -1]] = False
-    return (edges.astype(np.uint8) * 255), {
-        "width": int(gray.shape[1]),
-        "height": int(gray.shape[0]),
-        "edge_pixels": int(np.count_nonzero(edges)),
-        "low_threshold": low,
-        "high_threshold": high,
-    }
-
-
-def _convolve_axis(values: np.ndarray, kernel: np.ndarray, axis: int) -> np.ndarray:
-    pad = len(kernel) // 2
-    padded = np.pad(values, [(pad, pad) if current_axis == axis else (0, 0) for current_axis in range(values.ndim)], mode="edge")
-    result = np.zeros_like(values, dtype=np.float32)
-    for offset, weight in enumerate(kernel):
-        slices = [slice(None)] * values.ndim
-        slices[axis] = slice(offset, offset + values.shape[axis])
-        result += padded[tuple(slices)] * weight
-    return result
-
-
 def regularize_masked_buildings(
     meshes: list[Any],
     building_faces: set[tuple[int, int]],
     face_records: list[dict[str, Any]],
-    edge_map: np.ndarray,
+    line_map: np.ndarray,
     aggression: float = 0.5,
 ) -> list[dict[str, Any]]:
     """Regularize the nearest visible building component and reduce its interior triangles."""
@@ -583,9 +521,9 @@ def regularize_masked_buildings(
         if record is None:
             continue
         pixels = np.asarray(record.get("triangle_pixels", [record["pixel"]]), dtype=float).astype(int)
-        valid = (pixels[:, 0] >= 0) & (pixels[:, 0] < edge_map.shape[1]) & (pixels[:, 1] >= 0) & (pixels[:, 1] < edge_map.shape[0])
+        valid = (pixels[:, 0] >= 0) & (pixels[:, 0] < line_map.shape[1]) & (pixels[:, 1] >= 0) & (pixels[:, 1] < line_map.shape[0])
         if np.any(valid):
-            edge_score += float(np.mean(edge_map[pixels[valid, 1], pixels[valid, 0]] > 0))
+            edge_score += float(np.mean(line_map[pixels[valid, 1], pixels[valid, 0]] > 0))
     return [{
         "region": "building",
         "mesh_index": int(mesh_index),
@@ -596,7 +534,7 @@ def regularize_masked_buildings(
         "interior_vertex_count": len(interior),
         "boundary_vertex_count": len(perimeter),
         "boundary_vertices_preserved": True,
-        "canny_edge_score": edge_score / max(len(face_indices), 1),
+        "mlsd_line_score": edge_score / max(len(face_indices), 1),
         "axis_alignment": "dominant horizontal PCA axes with median-height horizontal bands",
         "aggression": aggression,
     }]
