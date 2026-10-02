@@ -409,16 +409,13 @@ class ModelWindow(pyglet.window.Window):
 			raise ValueError("artifact index is out of range")
 		artifact = artifacts[index]
 		asset_name = artifact.get(asset_field)
-		texture_name = artifact.get("result_render")
-		if not asset_name or not texture_name:
-			raise ValueError(f"artifact has no {label} mesh and generated result texture")
+		if not asset_name:
+			raise ValueError(f"artifact has no {label} mesh")
 		asset_path = CAPTURES_PATH / str(asset_name)
-		texture_path = CAPTURES_PATH / str(texture_name)
-		if not asset_path.is_file() or not texture_path.is_file():
-			raise ValueError(f"{label} mesh or generated result texture does not exist")
-		new_scene, new_camera = load_scene(
-			asset_path, texture_path=texture_path, camera_pose=artifact.get("camera_pose")
-		)
+		if not asset_path.is_file():
+			raise ValueError(f"{label} mesh does not exist")
+		LOGGER.info("Loading %s mesh without generated texture: artifact=%d asset=%s", label, index, asset_name)
+		new_scene, new_camera = load_scene(asset_path)
 		self.render_scene = new_scene
 		self.camera = new_camera
 		self._material_state = {}
