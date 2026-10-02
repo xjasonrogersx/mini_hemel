@@ -282,6 +282,10 @@ class ModelWindow(pyglet.window.Window):
 			self.navigate_to_artifact(int(command["index"]))
 		elif action == "view_refined":
 			self.view_refined_artifact(int(command["index"]))
+		elif action == "load_road_smoothed":
+			self.load_processed_artifact(int(command["index"]), "road_smoothing_asset", "road-smoothed")
+		elif action == "load_buildings_regularized":
+			self.load_processed_artifact(int(command["index"]), "building_regularization_asset", "building-regularized")
 		elif action == "segment":
 			self.run_segmentation_for_artifact(int(command["index"]))
 		elif action == "mask2former":
@@ -379,6 +383,31 @@ class ModelWindow(pyglet.window.Window):
 		self.update_camera()
 		self.navigate_to_artifact(index)
 		self.set_caption(f"Refined texture viewed for artifact {index + 1}")
+
+	def load_processed_artifact(self, index: int, asset_field: str, label: str) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		artifact = artifacts[index]
+		asset_name = artifact.get(asset_field)
+		texture_name = artifact.get("result_render")
+		if not asset_name or not texture_name:
+			raise ValueError(f"artifact has no {label} mesh and generated result texture")
+		asset_path = CAPTURES_PATH / str(asset_name)
+		texture_path = CAPTURES_PATH / str(texture_name)
+		if not asset_path.is_file() or not texture_path.is_file():
+			raise ValueError(f"{label} mesh or generated result texture does not exist")
+		new_scene, new_camera = load_scene(
+			asset_path, texture_path=texture_path, camera_pose=artifact.get("camera_pose")
+		)
+		self.render_scene = new_scene
+		self.camera = new_camera
+		self.orbit_target = new_scene._orbit_center.copy()
+		self.distance = new_scene._orbit_extent * 2.4
+		self.update_camera()
+		self.navigate_to_artifact(index)
+		self.set_caption(f"{label.capitalize()} mesh loaded for artifact {index + 1}")
 
 	def delete_grounding_dino_detection(self, index: int, prompt: str, detection_index: int) -> None:
 		with ARTIFACTS_LOCK:

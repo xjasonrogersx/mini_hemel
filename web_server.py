@@ -215,36 +215,25 @@ class ViewerWebServer:
         dino_image = artifact.get("result_render") or ""
         refined_asset = artifact.get("refined_asset")
         refinement_status = artifact.get("refinement_status")
-        refined_asset_html = (
-            f'<a href="/captures/{html.escape(str(refined_asset))}">Download refined GLTF</a>'
-            if refined_asset else ""
-        )
-        road_asset = artifact.get("road_smoothing_asset")
-        road_asset_html = (
-            f'<a href="/captures/{html.escape(str(road_asset))}">Download smoothed road GLTF</a>'
-            if road_asset else ""
-        )
-        building_asset = artifact.get("building_regularization_asset")
-        building_outputs_html = " ".join(
-            link for link in (
-                f'<a href="/captures/{html.escape(str(building_asset))}">Download regularized buildings GLTF</a>' if building_asset else "",
-            ) if link
-        )
         refined_view_button = (
             f'<button onclick="viewRefined()">View refined texture</button>'
             if refined_asset and artifact.get("result_render") else ""
         )
         refinement_summary = (
-            f'<p class="muted">Refinement status: {html.escape(str(refinement_status))}. {refined_view_button} {refined_asset_html}</p>'
+            f'<p class="muted">Refinement status: {html.escape(str(refinement_status))}. {refined_view_button}</p>'
             if refinement_status else ""
         )
-        road_summary = (
-            f'<p class="muted">Road smoothing status: {html.escape(str(artifact.get("road_smoothing_status")))}. {road_asset_html}</p>'
-            if artifact.get("road_smoothing_status") else ""
+        road_result = artifact.get("road_smoothing_asset")
+        building_result = artifact.get("building_regularization_asset")
+        road_section = (
+            f'<section class="operation"><h2>Road-smoothed mesh</h2><p class="muted">{html.escape(str(artifact.get("road_smoothing_status")))}</p><button onclick="smoothRoad()">Run road smoothing</button> <button onclick="loadRoadSmoothed()">Load road-smoothed mesh</button></section>'
+            if road_result else
+            '<section class="operation"><h2>Road-smoothed mesh</h2><p class="muted">No road-smoothed mesh yet.</p><button onclick="smoothRoad()">Run road smoothing</button></section>'
         )
-        building_summary = (
-            f'<p class="muted">Building regularization status: {html.escape(str(artifact.get("building_regularization_status")))}. {building_outputs_html}</p>'
-            if artifact.get("building_regularization_status") else ""
+        building_section = (
+            f'<section class="operation"><h2>Building-regularized mesh</h2><p class="muted">{html.escape(str(artifact.get("building_regularization_status")))}</p><label for="buildingAggression">Aggression</label> <input id="buildingAggression" class="range" type="range" min="0" max="1" step="0.05" value="0.5" oninput="document.getElementById(\'buildingAggressionValue\').textContent=Number(this.value).toFixed(2)"> <output id="buildingAggressionValue">0.50</output><p><button onclick="regularizeBuildings()">Run building regularization</button> <button onclick="loadBuildingsRegularized()">Load building-regularized mesh</button></p></section>'
+            if building_result else
+            '<section class="operation"><h2>Building-regularized mesh</h2><p class="muted">No building-regularized mesh yet.</p><label for="buildingAggression">Aggression</label> <input id="buildingAggression" class="range" type="range" min="0" max="1" step="0.05" value="0.5" oninput="document.getElementById(\'buildingAggressionValue\').textContent=Number(this.value).toFixed(2)"> <output id="buildingAggressionValue">0.50</output><p><button onclick="regularizeBuildings()">Run building regularization</button></p></section>'
         )
         pose = artifact.get("camera_pose", {})
         page = ARTIFACT_PAGE_HTML.format(
@@ -267,7 +256,7 @@ class ViewerWebServer:
                 {"prompt": prompt, "detection_index": detection_index}
                 for prompt, detection_index, _detection in detection_entries
             ]),
-            refinement_summary=refinement_summary + road_summary + building_summary,
+            refinement_summary=refinement_summary + road_section + building_section,
         )
         data = page.encode("utf-8")
         handler.send_response(200)
@@ -296,9 +285,10 @@ button,select,input {{ border:1px solid var(--line); background:var(--panel); bo
 .images {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }} figure {{ margin:0; background:var(--panel); border:1px solid var(--line); border-radius:6px; overflow:hidden; }} figure img {{ display:block; width:100%; aspect-ratio:4/3; object-fit:contain; background:#080b10; }} figcaption {{ padding:9px; overflow-wrap:anywhere; }}
 .controls {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:14px 0; }} .stage {{ position:relative; aspect-ratio:4/3; max-width:900px; background:#080b10; overflow:hidden; }} .stage img {{ position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }} .top {{ clip-path:inset(0 50% 0 0); }} .divider {{ position:absolute; top:0; bottom:0; left:50%; width:2px; background:var(--accent); pointer-events:none; }} .range {{ width:min(900px,100%); accent-color:var(--accent); }} .status {{ color:var(--cyan); }}
 .dino-stage {{ position:relative; width:min(900px,100%); background:#080b10; }} .dino-stage img {{ display:block; width:100%; height:auto; }} .dino-stage canvas {{ position:absolute; inset:0; width:100%; height:100%; }}
+.operation {{ margin:18px 0; padding:16px; background:var(--panel); border:1px solid var(--line); border-left:3px solid var(--accent); border-radius:6px; }} .operation h2 {{ margin:0 0 8px; }} .operation .range {{ width:min(420px,100%); vertical-align:middle; }} .operation output {{ display:inline-block; min-width:3em; color:var(--cyan); }}
 </style></head><body><main>
 <div class="head"><div><a href="/">&larr; All artifacts</a><h1>{title}</h1><div class="muted">{generator} &middot; {created_at}</div></div><div class="muted">yaw {yaw} &middot; pitch {pitch} &middot; distance {distance}</div></div>
-<p><button onclick="navigate()">Navigate display to this pose</button> <button onclick="segment()">Run / rerun SegFormer</button> <button onclick="mask2former()">Run / rerun Mask2Former</button> <button onclick="depthAnything()">Run / rerun Depth Anything on generated result</button> <button onclick="refineMesh()">Run / rerun mesh refinement</button> <button onclick="smoothRoad()">Smooth road from Mask2Former</button> <button onclick="regularizeBuildings()">Regularize buildings</button> <label for="buildingAggression">Aggression</label><input id="buildingAggression" type="range" min="0" max="1" step="0.05" value="0.5" oninput="document.getElementById('buildingAggressionValue').textContent=Number(this.value).toFixed(2)"><output id="buildingAggressionValue">0.50</output> <span id="status" class="status"></span></p>{refinement_summary}
+<p><button onclick="navigate()">Navigate display to this pose</button> <button onclick="segment()">Run / rerun SegFormer</button> <button onclick="mask2former()">Run / rerun Mask2Former</button> <button onclick="depthAnything()">Run / rerun Depth Anything on generated result</button> <button onclick="refineMesh()">Run / rerun mesh refinement</button> <span id="status" class="status"></span></p>{refinement_summary}
 <h2>Artifact images</h2><div class="images">{images}</div>
 <h2>Compare images from this artifact</h2><div class="controls"><label for="imageA">Image A</label><select id="imageA" onchange="updateCompare()">{options}</select><label for="imageB">Image B</label><select id="imageB" onchange="updateCompare()">{options}</select></div>
 <div class="stage"><img id="bottom" src="/captures/{first_image}" alt="Image B"><img id="top" class="top" src="/captures/{second_image}" alt="Image A"><div id="divider" class="divider"></div></div><label for="slider">Swipe position</label><br><input id="slider" class="range" type="range" min="0" max="100" value="50" oninput="updateCompare()">
@@ -306,6 +296,8 @@ button,select,input {{ border:1px solid var(--line); background:var(--panel); bo
 <script>
 async function navigate() {{ const status=document.getElementById('status'); status.textContent='Navigating...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'navigate',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Display moved to this pose':data.error; }}
 async function viewRefined() {{ const status=document.getElementById('status'); status.textContent='Loading refined texture...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'view_refined',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Refined texture loaded in viewer':data.error; }}
+async function loadRoadSmoothed() {{ const status=document.getElementById('status'); status.textContent='Loading road-smoothed mesh...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'load_road_smoothed',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Road-smoothed mesh loaded':data.error; }}
+async function loadBuildingsRegularized() {{ const status=document.getElementById('status'); status.textContent='Loading building-regularized mesh...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'load_buildings_regularized',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Building-regularized mesh loaded':data.error; }}
 async function segment() {{ const status=document.getElementById('status'); status.textContent='Starting SegFormer...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'segment',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'SegFormer started; refresh this page when complete':data.error; }}
 async function mask2former() {{ const status=document.getElementById('status'); status.textContent='Starting Mask2Former...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'mask2former',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Mask2Former started; refresh this page when complete':data.error; }}
 async function depthAnything() {{ const status=document.getElementById('status'); status.textContent='Starting Depth Anything on generated result...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'depth_anything',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Depth Anything started on generated result; refresh this page when complete':data.error; }}
