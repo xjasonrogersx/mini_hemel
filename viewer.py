@@ -36,6 +36,8 @@ from mesh_refinement import (
 	sample_mask,
 	sample_relative_depth,
 	visible_face_keys,
+	remove_vertices_inside_masks,
+	retile_mesh_holes,
 )
 
 
@@ -293,6 +295,10 @@ class ModelWindow(pyglet.window.Window):
 			self.view_refined_artifact(int(command["index"]))
 		elif action == "load_road_smoothed":
 			self.load_processed_artifact(int(command["index"]), "road_smoothing_asset", "road-smoothed")
+		elif action == "load_road_mask_vertex_removal":
+			self.load_processed_artifact(int(command["index"]), "road_mask_vertex_removal_asset", "road-mask vertex removal")
+		elif action == "load_road_mask_retiling":
+			self.load_road_mask_retiling(int(command["index"]))
 		elif action == "load_buildings_regularized":
 			self.load_processed_artifact(int(command["index"]), "building_regularization_asset", "building-regularized")
 		elif action == "segment":
@@ -330,6 +336,13 @@ class ModelWindow(pyglet.window.Window):
 		elif action == "smooth_road":
 			LOGGER.info("Road smoothing web action dispatched: artifact=%s", command.get("index"))
 			self.run_road_smoothing(int(command["index"]))
+		elif action == "remove_road_mask_vertices":
+			LOGGER.info("Road mask vertex removal test dispatched: artifact=%s", command.get("index"))
+			self.run_road_mask_vertex_removal(
+				int(command["index"]),
+				include_road=bool(command.get("include_road", True)),
+				include_sidewalk=bool(command.get("include_sidewalk", False)),
+			)
 		elif action == "regularize_buildings":
 			LOGGER.info("Building regularization web action dispatched: artifact=%s", command.get("index"))
 			self.run_building_regularization(int(command["index"]), float(command.get("aggression", 0.5)))
@@ -422,8 +435,8 @@ class ModelWindow(pyglet.window.Window):
 		self._visible_face_cache_key = None
 		self._visible_face_base_meshes = None
 		self.show_visible_faces = False
-		if not self.use_texture:
-			self.set_texture_mode(False)
+		self.set_texture_mode(True)
+		LOGGER.info("Enabled embedded mesh textures for %s deployment; generated texture not applied", label)
 		self.orbit_target = new_scene._orbit_center.copy()
 		self.distance = new_scene._orbit_extent * 2.4
 		self.update_camera()
@@ -479,6 +492,107 @@ class ModelWindow(pyglet.window.Window):
 		).start()
 		self.set_caption(f"Road smoothing started for artifact {index + 1}")
 
+	def run_road_mask_vertex_removal(
+		self, index: int, include_road: bool = True, include_sidewalk: bool = False
+	) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		with ARTIFACTS_LOCK:
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			artifacts[index]["road_mask_vertex_removal_status"] = "running"
+			artifacts[index].pop("road_mask_vertex_removal_asset", None)
+			artifacts[index].pop("road_mask_vertex_retiling_asset", None)
+			artifacts[index].pop("road_mask_vertex_removal_stats", None)
+			artifacts[index].pop("road_mask_vertex_removal_masks", None)
+			with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+				json.dump(artifacts, artifacts_file, indent=2)
+		threading.Thread(
+			target=self._run_road_mask_vertex_removal_worker,
+			args=(index, include_road, include_sidewalk),
+			name=f"road-mask-vertex-removal-{index}",
+			daemon=True,
+		).start()
+		self.set_caption(f"Road mask vertex removal test started for artifact {index + 1}")
+
+	def load_road_mask_retiling(self, index: int) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		if artifacts[index].get("road_mask_vertex_removal_status") != "completed":
+			raise ValueError("retiled mesh is not ready; wait for the mask removal test to finish")
+		self.load_processed_artifact(index, "road_mask_vertex_retiling_asset", "road-mask retiling")
+
+	def _run_road_mask_vertex_removal_worker(
+		self, index: int, include_road: bool, include_sidewalk: bool
+	) -> None:
+		try:
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			artifact = artifacts[index]
+			mask_names = [
+				CAPTURES_PATH / str(name)
+				for name in artifact.get("mask2former_masks", [])
+				if (
+					(include_road and "mask2former_road" in str(name).lower())
+					or (include_sidewalk and "mask2former_sidewalk" in str(name).lower())
+				)
+				and (CAPTURES_PATH / str(name)).is_file()
+			]
+			camera_pose = artifact.get("camera_pose", {})
+			capture_size = camera_pose.get("capture_size", {})
+			if not mask_names or "matrix" not in camera_pose or not capture_size:
+				raise ValueError("artifact is missing selected road/sidewalk mask, camera matrix, or capture size")
+			loaded = trimesh.load(ASSET_PATH, file_type="gltf", force="scene")
+			if not isinstance(loaded, trimesh.Scene):
+				loaded = trimesh.Scene(loaded)
+			meshes = loaded.dump(concatenate=False)
+			stats = remove_vertices_inside_masks(
+				meshes, mask_names, camera_pose["matrix"], capture_size
+			)
+			if stats["vertices_removed"] == 0:
+				raise ValueError("road mask contains no projected mesh vertices")
+			output_name = f"road_mask_vertices_removed_{index}.gltf"
+			trimesh.Scene(meshes).export(CAPTURES_PATH / output_name, file_type="gltf")
+			retiled_meshes, added_triangles = retile_mesh_holes(meshes)
+			retiled_output_name = f"road_mask_vertices_retiled_{index}.gltf"
+			trimesh.Scene(retiled_meshes).export(CAPTURES_PATH / retiled_output_name, file_type="gltf")
+			stats["triangles_added"] = added_triangles
+			LOGGER.info(
+				"Road mask retiling: artifact=%d new_flat_triangles=%d output=%s",
+				index, added_triangles, retiled_output_name,
+			)
+			LOGGER.info(
+				"Road mask vertex removal test: artifact=%d vertices_removed=%d triangles_removed=%d triangles_added=%d output=%s retiled_output=%s",
+				index, stats["vertices_removed"], stats["triangles_removed"], added_triangles, output_name, retiled_output_name,
+			)
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index]["road_mask_vertex_removal_asset"] = output_name
+				artifacts[index]["road_mask_vertex_retiling_asset"] = retiled_output_name
+				artifacts[index]["road_mask_vertex_removal_status"] = "completed"
+				artifacts[index]["road_mask_vertex_removal_stats"] = stats
+				artifacts[index]["road_mask_vertex_removal_masks"] = [path.name for path in mask_names]
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			self.set_caption(f"Road mask removal saved: {output_name}")
+		except Exception as exc:
+			try:
+				with ARTIFACTS_LOCK:
+					with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+						artifacts = json.load(artifacts_file)
+					artifacts[index]["road_mask_vertex_removal_status"] = "failed"
+					with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+						json.dump(artifacts, artifacts_file, indent=2)
+			except Exception:
+				LOGGER.exception("Failed to persist road mask removal failure status")
+			self.set_caption(f"Road mask removal failed: {exc}")
+			LOGGER.exception("Road mask vertex removal failed for artifact %d", index)
+
 	def _run_road_smoothing_worker(self, index: int) -> None:
 		try:
 			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
@@ -498,6 +612,8 @@ class ModelWindow(pyglet.window.Window):
 			if not isinstance(loaded, trimesh.Scene):
 				loaded = trimesh.Scene(loaded)
 			meshes = loaded.dump(concatenate=False)
+			original_vertices = [np.asarray(mesh.vertices, dtype=np.float64).copy() for mesh in meshes]
+			original_triangle_count = sum(len(mesh.faces) for mesh in meshes)
 			face_records = project_scene_faces(loaded, camera_pose, capture_size)
 			road_masks = [
 				sample_mask(CAPTURES_PATH / name, face_records, capture_size)
@@ -506,9 +622,60 @@ class ModelWindow(pyglet.window.Window):
 			]
 			if not road_masks:
 				raise ValueError("Mask2Former road segmentation image does not exist")
+			masked_vertices_by_mesh: dict[int, set[int]] = {}
+			for road_mask in road_masks:
+				for mesh_index, face_index in road_mask.get("selected_faces", []):
+					if not (0 <= int(mesh_index) < len(meshes)):
+						continue
+					face = np.asarray(meshes[int(mesh_index)].faces[int(face_index)], dtype=np.int64)
+					masked_vertices_by_mesh.setdefault(int(mesh_index), set()).update(int(vertex) for vertex in face)
+			masked_vertex_count = sum(len(vertices) for vertices in masked_vertices_by_mesh.values())
+			LOGGER.info(
+				"Road mask vertex coverage: artifact=%d selected_faces=%d masked_vertices=%d meshes=%d",
+				index,
+				sum(int(mask.get("selected_count", 0)) for mask in road_masks),
+				masked_vertex_count,
+				len(masked_vertices_by_mesh),
+			)
 			changes = smooth_masked_road(meshes, road_masks)
 			if not changes:
 				raise ValueError("Mask2Former road mask selected no smoothable road vertices")
+			modified_triangle_count = 0
+			for mesh, original in zip(meshes, original_vertices):
+				moved_vertices = np.linalg.norm(
+					np.asarray(mesh.vertices, dtype=np.float64) - original, axis=1
+				) > 1e-8
+				if np.any(moved_vertices):
+					modified_triangle_count += int(np.any(moved_vertices[np.asarray(mesh.faces)], axis=1).sum())
+			processed_triangle_count = sum(len(mesh.faces) for mesh in meshes)
+			removed_triangle_count = max(0, original_triangle_count - processed_triangle_count)
+			triangle_stats = {
+				"triangles_before": original_triangle_count,
+				"triangles_after": processed_triangle_count,
+				"triangles_removed": removed_triangle_count,
+				"triangles_modified": modified_triangle_count,
+			}
+			vertex_stats = {
+				"masked_vertices": masked_vertex_count,
+				"meshes_with_masked_vertices": len(masked_vertices_by_mesh),
+				"moved_vertices": sum(int(change.get("moved_vertex_count", 0)) for change in changes),
+				"smoothable_vertices": sum(int(change.get("interior_vertex_count", 0)) for change in changes),
+			}
+			LOGGER.info(
+				"Road smoothing vertex stats: artifact=%d masked=%d smoothable=%d moved=%d",
+				index,
+				vertex_stats["masked_vertices"],
+				vertex_stats["smoothable_vertices"],
+				vertex_stats["moved_vertices"],
+			)
+			LOGGER.info(
+				"Road smoothing triangle stats: artifact=%d before=%d after=%d removed=%d modified=%d",
+				index,
+				original_triangle_count,
+				processed_triangle_count,
+				removed_triangle_count,
+				modified_triangle_count,
+			)
 			output_name = f"road_smoothed_{index}.gltf"
 			output_path = CAPTURES_PATH / output_name
 			trimesh.Scene(meshes).export(output_path, file_type="gltf")
@@ -518,6 +685,8 @@ class ModelWindow(pyglet.window.Window):
 				artifacts[index]["road_smoothing_asset"] = output_name
 				artifacts[index]["road_smoothing_status"] = "smoothed"
 				artifacts[index]["road_smoothing_changes"] = changes
+				artifacts[index]["road_smoothing_triangle_stats"] = triangle_stats
+				artifacts[index]["road_smoothing_vertex_stats"] = vertex_stats
 				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
 					json.dump(artifacts, artifacts_file, indent=2)
 			self.set_caption(f"Road smoothing saved: {output_name}")

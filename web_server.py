@@ -229,11 +229,55 @@ class ViewerWebServer:
             f'<p>{refined_view_button or "No reprojected texture available yet."}</p></section>'
         )
         road_result = artifact.get("road_smoothing_asset")
+        road_removal_result = artifact.get("road_mask_vertex_removal_asset")
+        road_retiling_result = artifact.get("road_mask_vertex_retiling_asset")
+        road_removal_status = str(artifact.get("road_mask_vertex_removal_status") or "not started")
+        road_removal_stats = artifact.get("road_mask_vertex_removal_stats", {})
+        road_retiling_button = (
+            '<button onclick="loadRoadMaskRetiling()">Deploy retiled mesh</button>'
+            if road_retiling_result and road_removal_status == "completed" else
+            '<button disabled>Retiled mesh unavailable while test is running</button>'
+            if road_retiling_result and road_removal_status == "running" else
+            ""
+        )
+        road_removal_controls = (
+            '<label><input id="removeRoadMask" type="checkbox" checked> road</label> '
+            '<label><input id="removeSidewalkMask" type="checkbox"> sidewalk</label> '
+        )
+        road_removal_section = (
+            f'<p class="muted">Test status: {html.escape(road_removal_status)}. '
+            f'Removed vertices: {int(road_removal_stats.get("vertices_removed", 0))}; '
+            f'incident triangles: {int(road_removal_stats.get("triangles_removed", 0))}; '
+            f'retiled flat triangles: {int(road_removal_stats.get("triangles_added", 0))}.</p>'
+            f'<p>{road_removal_controls}<button onclick="removeRoadMaskVertices()">Rerun mask vertex removal test</button> '
+            f'<button onclick="loadRoadMaskVertexRemoval()">Deploy test mesh</button> '
+            f'{road_retiling_button}</p>'
+            if road_removal_result and isinstance(road_removal_stats, dict) else
+            '<p class="muted">Test not run yet. This removes vertices projected inside the road mask and the triangles attached to them.</p>'
+            f'<p>{road_removal_controls}<button onclick="removeRoadMaskVertices()">Run mask vertex removal test</button></p>'
+        )
+        road_triangle_stats = artifact.get("road_smoothing_triangle_stats", {})
+        road_triangle_summary = (
+            f'<p class="muted">Triangles: {int(road_triangle_stats.get("triangles_before", 0))} before, '
+            f'{int(road_triangle_stats.get("triangles_after", 0))} after; '
+            f'{int(road_triangle_stats.get("triangles_modified", 0))} modified, '
+            f'{int(road_triangle_stats.get("triangles_removed", 0))} removed.</p>'
+            if isinstance(road_triangle_stats, dict) and road_triangle_stats else
+            '<p class="muted">Triangle statistics are not available for this mesh yet.</p>'
+        )
+        road_vertex_stats = artifact.get("road_smoothing_vertex_stats", {})
+        road_vertex_summary = (
+            f'<p class="muted">Masked vertices: {int(road_vertex_stats.get("masked_vertices", 0))}; '
+            f'smoothable: {int(road_vertex_stats.get("smoothable_vertices", 0))}; '
+            f'moved: {int(road_vertex_stats.get("moved_vertices", 0))}.</p>'
+            if isinstance(road_vertex_stats, dict) and road_vertex_stats else
+            '<p class="muted">Masked vertex statistics are not available for this mesh yet.</p>'
+        )
         building_result = artifact.get("building_regularization_asset")
         road_section = (
-            f'<section class="operation"><h2>Road-smoothed mesh</h2><p class="muted">Smooths road geometry using the detected road mask. Deploying it loads the modified mesh only and does not apply the generated texture.</p><p class="muted">Status: {html.escape(str(artifact.get("road_smoothing_status")))}</p><button onclick="smoothRoad()">Run road smoothing</button> <button onclick="loadRoadSmoothed()">Deploy mesh to viewer</button></section>'
+            f'<section class="operation"><h2>Road-smoothed mesh</h2><p class="muted">Smooths road geometry using the detected road mask. Deploying it loads the modified mesh only and does not apply the generated texture.</p><p class="muted">Status: {html.escape(str(artifact.get("road_smoothing_status")))}</p>{road_vertex_summary}{road_triangle_summary}<button onclick="smoothRoad()">Run road smoothing</button> <button onclick="loadRoadSmoothed()">Deploy mesh to viewer</button>{road_removal_section}</section>'
             if road_result else
-            '<section class="operation"><h2>Road-smoothed mesh</h2><p class="muted">Smooths road geometry using the detected road mask. Deployment loads the modified mesh only and does not apply the generated texture.</p><p class="muted">No road-smoothed mesh yet.</p><button onclick="smoothRoad()">Run road smoothing</button></section>'
+            f'<section class="operation"><h2>Road-smoothed mesh</h2><p class="muted">Smooths road geometry using the detected road mask. Deployment loads the modified mesh only and does not apply the generated texture.</p><p class="muted">No road-smoothed mesh yet.</p><button onclick="smoothRoad()">Run road smoothing</button>{road_removal_section}</section>'
         )
         building_section = (
             f'<section class="operation"><h2>Building-regularized mesh</h2><p class="muted">Aligns and simplifies building surfaces using building masks and M-LSD structural lines. Deployment loads the modified mesh only and does not apply the generated texture.</p><p class="muted">Status: {html.escape(str(artifact.get("building_regularization_status")))}</p><p class="muted">M-LSD lines: {html.escape(str(artifact.get("building_regularization_lines_status", "not generated")))}</p><label for="buildingAggression">Aggression</label> <input id="buildingAggression" class="range" type="range" min="0" max="1" step="0.05" value="0.5" oninput="document.getElementById(\'buildingAggressionValue\').textContent=Number(this.value).toFixed(2)"> <output id="buildingAggressionValue">0.50</output><p><button onclick="runMlsd()">Run / rerun M-LSD</button> <button onclick="regularizeBuildings()">Run building regularization</button> <button onclick="loadBuildingsRegularized()">Deploy mesh to viewer</button></p></section>'
@@ -309,6 +353,9 @@ async function runMlsd() {{ const status=document.getElementById('status'); stat
 async function depthAnything() {{ const status=document.getElementById('status'); status.textContent='Starting Depth Anything on generated result...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'depth_anything',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Depth Anything started on generated result; refresh this page when complete':data.error; }}
 async function refineMesh() {{ const status=document.getElementById('refinementStatus'); status.textContent='Refinement status: starting...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'refine_mesh',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Refinement status: started; refresh this page when complete':'Refinement status: '+data.error; }}
 async function smoothRoad() {{ const status=document.getElementById('status'); status.textContent='Starting road smoothing...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'smooth_road',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Road smoothing started; refresh this page when complete':data.error; }}
+async function removeRoadMaskVertices() {{ const status=document.getElementById('status'); const includeRoad=document.getElementById('removeRoadMask').checked; const includeSidewalk=document.getElementById('removeSidewalkMask').checked; if(!includeRoad && !includeSidewalk) {{ status.textContent='Select road or sidewalk first'; return; }} status.textContent='Starting road-mask vertex removal test...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'remove_road_mask_vertices',index:{index},include_road:includeRoad,include_sidewalk:includeSidewalk}})}}); const data=await response.json(); status.textContent=data.ok?'Road-mask vertex removal started; refresh this page when complete':data.error; }}
+async function loadRoadMaskVertexRemoval() {{ const status=document.getElementById('status'); status.textContent='Deploying test mesh...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'load_road_mask_vertex_removal',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Road-mask removal test mesh loaded':data.error; }}
+async function loadRoadMaskRetiling() {{ const status=document.getElementById('status'); status.textContent='Deploying retiled mesh...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'load_road_mask_retiling',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Retiled mesh loaded':data.error; }}
 async function regularizeBuildings() {{ const status=document.getElementById('status'); const aggression=Number(document.getElementById('buildingAggression').value); status.textContent='Starting building regularization...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'regularize_buildings',index:{index},aggression:aggression}})}}); const data=await response.json(); status.textContent=data.ok?'Building regularization started; refresh this page when complete':data.error; }}
 async function groundingDino() {{ const status=document.getElementById('status'); status.textContent='Starting Grounding DINO...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'grounding_dino',index:{index},prompt:document.getElementById('dinoPrompt').value}})}}); const data=await response.json(); status.textContent=data.ok?'Grounding DINO started; refresh this page when complete':data.error; }}
 async function sam2All() {{ const status=document.getElementById('status'); status.textContent='Starting SAM2 for all boxes...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'sam2_all',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'SAM2 started for all boxes; refresh this page when complete':data.error; }}

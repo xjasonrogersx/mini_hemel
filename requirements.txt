@@ -2,6 +2,7 @@ numpy
 pyglet
 pyrender==0.1.45
 trimesh
+mapbox-earcut
 networkx>=2.8
 Pillow
 opencv-python-headless

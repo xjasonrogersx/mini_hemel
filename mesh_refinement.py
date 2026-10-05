@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import trimesh
+import mapbox_earcut
 from PIL import Image
 
 
@@ -255,6 +257,168 @@ def sample_mask(mask_path: Path, face_records: list[dict[str, Any]], capture_siz
         "coverage_threshold": 0.25,
         "coverage_by_face": coverage_by_face,
     }
+
+
+def remove_vertices_inside_masks(
+    meshes: list[Any],
+    mask_paths: list[Path],
+    camera_matrix: Any,
+    capture_size: dict[str, Any],
+) -> dict[str, int]:
+    """Remove vertices whose projected pixels are inside any supplied mask."""
+    removed_vertices = 0
+    removed_triangles = 0
+    for mesh in meshes:
+        vertices = np.asarray(mesh.vertices, dtype=np.float64)
+        pixels, depths = project_points(vertices, camera_matrix, capture_size)
+        remove = np.zeros(len(vertices), dtype=bool)
+        for mask_path in mask_paths:
+            with Image.open(mask_path) as image:
+                mask = np.asarray(image.convert("L"))
+            height, width = mask.shape[:2]
+            scale_x = width / float(capture_size["width"])
+            scale_y = height / float(capture_size["height"])
+            valid = (
+                (depths > 0)
+                & (pixels[:, 0] >= 0)
+                & (pixels[:, 0] < capture_size["width"])
+                & (pixels[:, 1] >= 0)
+                & (pixels[:, 1] < capture_size["height"])
+            )
+            mask_x = np.clip((pixels[:, 0] * scale_x).astype(int), 0, width - 1)
+            mask_y = np.clip((pixels[:, 1] * scale_y).astype(int), 0, height - 1)
+            remove |= valid & (mask[mask_y, mask_x] > 0)
+        faces = np.asarray(mesh.faces, dtype=np.int64)
+        if len(faces):
+            outside_counts = (~remove[faces]).sum(axis=1)
+            boundary_faces = faces[outside_counts >= 2]
+            if len(boundary_faces):
+                remove[np.unique(boundary_faces)] = False
+        if not np.any(remove):
+            continue
+        removed_vertices += int(np.count_nonzero(remove))
+        face_keep = ~np.any(remove[faces], axis=1)
+        removed_triangles += int(np.count_nonzero(~face_keep))
+        removed_vertex_connections: dict[int, set[int]] = {}
+        for face in faces[~face_keep]:
+            for vertex in face:
+                vertex = int(vertex)
+                if not remove[vertex]:
+                    continue
+                removed_vertex_connections.setdefault(vertex, set()).update(
+                    int(neighbor) for neighbor in face if int(neighbor) != vertex
+                )
+        for vertex in removed_vertex_connections:
+            removed_vertex_connections[vertex].difference_update(
+                int(neighbor) for neighbor in np.flatnonzero(remove)
+            )
+        surviving_connected_vertices = sorted({
+            neighbor
+            for neighbors in removed_vertex_connections.values()
+            for neighbor in neighbors
+            if not remove[neighbor]
+        })
+        kept_edge_set = {
+            edge
+            for face in faces[face_keep]
+            for edge in (
+                tuple(sorted((int(face[0]), int(face[1])))),
+                tuple(sorted((int(face[1]), int(face[2])))),
+                tuple(sorted((int(face[2]), int(face[0])))),
+            )
+        }
+        removed_edge_set = {
+            edge
+            for face in faces[~face_keep]
+            for edge in (
+                tuple(sorted((int(face[0]), int(face[1])))),
+                tuple(sorted((int(face[1]), int(face[2])))),
+                tuple(sorted((int(face[2]), int(face[0])))),
+            )
+        }
+        kept_vertices = np.flatnonzero(~remove)
+        remap = np.full(len(vertices), -1, dtype=np.int64)
+        remap[kept_vertices] = np.arange(len(kept_vertices), dtype=np.int64)
+        old_visual = mesh.visual
+        old_uv = getattr(old_visual, "uv", None)
+        old_material = getattr(old_visual, "material", None)
+        old_face_colors = getattr(old_visual, "face_colors", None)
+        mesh.vertices = vertices[kept_vertices]
+        mesh.faces = remap[faces[face_keep]]
+        mesh._mask_hole_boundary_edges = [
+            (remap[first], remap[second])
+            for first, second in kept_edge_set & removed_edge_set
+            if remap[first] >= 0 and remap[second] >= 0
+        ]
+        mesh._mask_hole_boundary_vertices = [
+            int(remap[vertex]) for vertex in surviving_connected_vertices if remap[vertex] >= 0
+        ]
+        if old_uv is not None and len(old_uv) == len(vertices):
+            mesh.visual = trimesh.visual.texture.TextureVisuals(
+                uv=np.asarray(old_uv)[kept_vertices], material=old_material
+            )
+        elif old_face_colors is not None and len(old_face_colors) == len(faces):
+            mesh.visual = trimesh.visual.ColorVisuals(
+                mesh=mesh, face_colors=np.asarray(old_face_colors)[face_keep]
+            )
+        else:
+            mesh.visual = trimesh.visual.ColorVisuals(mesh=mesh)
+    return {
+        "vertices_removed": removed_vertices,
+        "triangles_removed": removed_triangles,
+    }
+
+
+def retile_mesh_holes(
+    meshes: list[Any], flat_color: tuple[int, int, int, int] = (180, 180, 180, 255)
+) -> tuple[list[Any], int]:
+    """Cap mask-created boundary regions and return flat-color meshes."""
+    flat_meshes = []
+    added_triangles = 0
+    for mesh in meshes:
+        if not len(mesh.faces):
+            continue
+        boundary_vertices = set(getattr(mesh, "_mask_hole_boundary_vertices", []))
+        if len(boundary_vertices) < 3:
+            continue
+        vertex_indices = np.asarray(sorted(boundary_vertices), dtype=np.int64)
+        boundary_points = np.asarray(mesh.vertices)[vertex_indices]
+        center = boundary_points.mean(axis=0)
+        _, _, basis = np.linalg.svd(boundary_points - center, full_matrices=False)
+        coordinates_2d = (boundary_points - center) @ basis[:2].T
+        order = sorted(
+            range(len(coordinates_2d)),
+            key=lambda index: (coordinates_2d[index, 0], coordinates_2d[index, 1]),
+        )
+
+        def cross(first: int, second: int, third: int) -> float:
+            a, b, c = coordinates_2d[first], coordinates_2d[second], coordinates_2d[third]
+            return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+
+        hull: list[int] = []
+        for index in order + order[::-1]:
+            while len(hull) >= 2 and cross(hull[-2], hull[-1], index) <= 1e-9:
+                hull.pop()
+            hull.append(index)
+        hull = hull[:-1]
+        if len(hull) < 3:
+            continue
+        polygon = coordinates_2d[np.asarray(hull, dtype=np.int64)]
+        indices = mapbox_earcut.triangulate_float64(
+            polygon, np.asarray([len(polygon)], dtype=np.uint32)
+        )
+        if not len(indices):
+            continue
+        flat_vertices = boundary_points[np.asarray(hull, dtype=np.int64)]
+        flat_faces = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
+        flat_meshes.append(trimesh.Trimesh(
+            vertices=flat_vertices,
+            faces=flat_faces,
+            vertex_colors=np.tile(np.asarray(flat_color, dtype=np.uint8), (len(flat_vertices), 1)),
+            process=False,
+        ))
+        added_triangles += len(flat_faces)
+    return meshes + flat_meshes, added_triangles
 
 
 def apply_conservative_geometry_refinement(
