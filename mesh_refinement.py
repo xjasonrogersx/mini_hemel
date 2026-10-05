@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import open3d as o3d
 import trimesh
 import mapbox_earcut
 from PIL import Image
@@ -336,15 +337,33 @@ def remove_vertices_inside_masks(
                 tuple(sorted((int(face[2]), int(face[0])))),
             )
         }
-        kept_vertices = np.flatnonzero(~remove)
+        kept_vertices = np.unique(faces[face_keep]) if np.any(face_keep) else np.empty(0, dtype=np.int64)
         remap = np.full(len(vertices), -1, dtype=np.int64)
         remap[kept_vertices] = np.arange(len(kept_vertices), dtype=np.int64)
         old_visual = mesh.visual
         old_uv = getattr(old_visual, "uv", None)
         old_material = getattr(old_visual, "material", None)
         old_face_colors = getattr(old_visual, "face_colors", None)
-        mesh.vertices = vertices[kept_vertices]
-        mesh.faces = remap[faces[face_keep]]
+        open3d_mesh = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(vertices),
+            o3d.utility.Vector3iVector(faces),
+        )
+        open3d_mesh.remove_triangles_by_mask((~face_keep).tolist())
+        open3d_mesh.remove_unreferenced_vertices()
+        if len(open3d_mesh.triangles):
+            open3d_mesh.compute_vertex_normals()
+            boundary_positions = vertices[surviving_connected_vertices].copy()
+            open3d_mesh.filter_smooth_taubin(number_of_iterations=2, lambda_filter=0.35, mu=-0.34)
+            smoothed_vertices = np.asarray(open3d_mesh.vertices)
+            for boundary_index, position in zip(
+                [int(remap[index]) for index in surviving_connected_vertices], boundary_positions
+            ):
+                if 0 <= boundary_index < len(smoothed_vertices):
+                    smoothed_vertices[boundary_index] = position
+            open3d_mesh.vertices = o3d.utility.Vector3dVector(smoothed_vertices)
+            open3d_mesh.compute_vertex_normals()
+        mesh.vertices = np.asarray(open3d_mesh.vertices)
+        mesh.faces = np.asarray(open3d_mesh.triangles, dtype=np.int64)
         mesh._mask_hole_boundary_edges = [
             (remap[first], remap[second])
             for first, second in kept_edge_set & removed_edge_set
@@ -372,7 +391,7 @@ def remove_vertices_inside_masks(
 def retile_mesh_holes(
     meshes: list[Any], flat_color: tuple[int, int, int, int] = (180, 180, 180, 255)
 ) -> tuple[list[Any], int]:
-    """Cap mask-created boundary regions and return flat-color meshes."""
+    """Fill mask-created Open3D boundary loops with flat-color meshes."""
     flat_meshes = []
     added_triangles = 0
     for mesh in meshes:
@@ -381,43 +400,86 @@ def retile_mesh_holes(
         boundary_vertices = set(getattr(mesh, "_mask_hole_boundary_vertices", []))
         if len(boundary_vertices) < 3:
             continue
-        vertex_indices = np.asarray(sorted(boundary_vertices), dtype=np.int64)
-        boundary_points = np.asarray(mesh.vertices)[vertex_indices]
-        center = boundary_points.mean(axis=0)
-        _, _, basis = np.linalg.svd(boundary_points - center, full_matrices=False)
-        coordinates_2d = (boundary_points - center) @ basis[:2].T
-        order = sorted(
-            range(len(coordinates_2d)),
-            key=lambda index: (coordinates_2d[index, 0], coordinates_2d[index, 1]),
+        open3d_mesh = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(np.asarray(mesh.vertices)),
+            o3d.utility.Vector3iVector(np.asarray(mesh.faces, dtype=np.int32)),
         )
-
-        def cross(first: int, second: int, third: int) -> float:
-            a, b, c = coordinates_2d[first], coordinates_2d[second], coordinates_2d[third]
-            return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
-
-        hull: list[int] = []
-        for index in order + order[::-1]:
-            while len(hull) >= 2 and cross(hull[-2], hull[-1], index) <= 1e-9:
-                hull.pop()
-            hull.append(index)
-        hull = hull[:-1]
-        if len(hull) < 3:
-            continue
-        polygon = coordinates_2d[np.asarray(hull, dtype=np.int64)]
-        indices = mapbox_earcut.triangulate_float64(
-            polygon, np.asarray([len(polygon)], dtype=np.uint32)
-        )
-        if not len(indices):
-            continue
-        flat_vertices = boundary_points[np.asarray(hull, dtype=np.int64)]
-        flat_faces = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
-        flat_meshes.append(trimesh.Trimesh(
-            vertices=flat_vertices,
-            faces=flat_faces,
-            vertex_colors=np.tile(np.asarray(flat_color, dtype=np.uint8), (len(flat_vertices), 1)),
-            process=False,
-        ))
-        added_triangles += len(flat_faces)
+        try:
+            half_edges = o3d.geometry.HalfEdgeTriangleMesh.create_from_triangle_mesh(open3d_mesh)
+            boundary_loops = [[int(index) for index in loop] for loop in half_edges.get_boundaries()]
+        except RuntimeError:
+            edge_array = np.asarray(mesh.edges_unique, dtype=np.int64)
+            edge_counts = np.bincount(
+                np.asarray(mesh.edges_unique_inverse, dtype=np.int64), minlength=len(edge_array)
+            )
+            boundary_edges = edge_array[edge_counts == 1]
+            adjacency: dict[int, set[int]] = {}
+            for first, second in boundary_edges:
+                adjacency.setdefault(int(first), set()).add(int(second))
+                adjacency.setdefault(int(second), set()).add(int(first))
+            boundary_loops = []
+            remaining_vertices = set(adjacency)
+            while remaining_vertices:
+                start = min(remaining_vertices)
+                component = {start}
+                pending = [start]
+                while pending:
+                    current = pending.pop()
+                    for neighbor in adjacency[current]:
+                        if neighbor not in component:
+                            component.add(neighbor)
+                            pending.append(neighbor)
+                remaining_vertices.difference_update(component)
+                if len(component & boundary_vertices) < 2:
+                    continue
+                if any(len(adjacency[index]) != 2 for index in component):
+                    continue
+                loop = [start]
+                previous = -1
+                current = start
+                while True:
+                    candidates = [index for index in adjacency[current] if index != previous]
+                    next_index = candidates[0]
+                    if next_index == start:
+                        break
+                    loop.append(next_index)
+                    previous, current = current, next_index
+                    if len(loop) > len(component):
+                        loop = []
+                        break
+                if len(loop) >= 3:
+                    boundary_loops.append(loop)
+        for boundary_loop in boundary_loops:
+            loop = [int(index) for index in boundary_loop]
+            if len(loop) < 3 or len(set(loop) & boundary_vertices) < 2:
+                continue
+            loop_vertices = np.asarray(open3d_mesh.vertices)[np.asarray(loop, dtype=np.int64)]
+            if len(np.unique(loop_vertices, axis=0)) < 3:
+                continue
+            center = loop_vertices.mean(axis=0)
+            _, _, basis = np.linalg.svd(loop_vertices - center, full_matrices=False)
+            coordinates_2d = (loop_vertices - center) @ basis[:2].T
+            indices = mapbox_earcut.triangulate_float64(
+                coordinates_2d, np.asarray([len(coordinates_2d)], dtype=np.uint32)
+            )
+            if not len(indices):
+                continue
+            flat_faces = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
+            open3d_patch = o3d.geometry.TriangleMesh(
+                o3d.utility.Vector3dVector(loop_vertices),
+                o3d.utility.Vector3iVector(flat_faces),
+            )
+            open3d_patch.compute_vertex_normals()
+            flat_meshes.append(trimesh.Trimesh(
+                vertices=np.asarray(open3d_patch.vertices),
+                faces=np.asarray(open3d_patch.triangles, dtype=np.int64),
+                vertex_colors=np.tile(
+                    np.asarray(flat_color, dtype=np.uint8),
+                    (len(open3d_patch.vertices), 1),
+                ),
+                process=False,
+            ))
+            added_triangles += len(open3d_patch.triangles)
     return meshes + flat_meshes, added_triangles
 
 

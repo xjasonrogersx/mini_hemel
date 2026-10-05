@@ -2,6 +2,7 @@ numpy
 pyglet
 pyrender==0.1.45
 trimesh
+open3d
 mapbox-earcut
 networkx>=2.8
 Pillow
