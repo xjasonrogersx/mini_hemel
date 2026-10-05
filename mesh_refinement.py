@@ -337,6 +337,62 @@ def remove_vertices_inside_masks(
                 tuple(sorted((int(face[2]), int(face[0])))),
             )
         }
+        dead_faces = np.flatnonzero(~face_keep)
+        face_neighbors: dict[int, set[int]] = {}
+        all_vertex_faces: dict[int, set[int]] = {}
+        for face_index, face in enumerate(faces):
+            for vertex in face:
+                all_vertex_faces.setdefault(int(vertex), set()).add(int(face_index))
+        for face_index in dead_faces:
+            for vertex in faces[face_index]:
+                face_neighbors.setdefault(int(vertex), set()).add(int(face_index))
+        dead_components = []
+        unseen_faces = set(int(face_index) for face_index in dead_faces)
+        while unseen_faces:
+            component = {unseen_faces.pop()}
+            pending = list(component)
+            while pending:
+                face_index = pending.pop()
+                for vertex in faces[face_index]:
+                    adjacent = face_neighbors[int(vertex)] & unseen_faces
+                    component.update(adjacent)
+                    unseen_faces.difference_update(adjacent)
+                    pending.extend(adjacent)
+            dead_components.append(component)
+        boundary_regions = []
+        removed_patches = []
+        for component in dead_components:
+            component_faces = faces[np.asarray(sorted(component), dtype=np.int64)]
+            component_vertices = set(int(vertex) for vertex in component_faces.reshape(-1))
+            patch_indices = np.asarray(sorted(component_vertices), dtype=np.int64)
+            patch_remap = {int(vertex): index for index, vertex in enumerate(patch_indices)}
+            removed_patches.append({
+                "vertices": vertices[patch_indices].tolist(),
+                "faces": [
+                    [patch_remap[int(vertex)] for vertex in face]
+                    for face in component_faces
+                ],
+            })
+            region_vertices = sorted({
+                int(vertex)
+                for removed_vertex in component_vertices
+                if remove[removed_vertex]
+                for face_index in all_vertex_faces[removed_vertex]
+                for vertex in faces[face_index]
+                if not remove[int(vertex)]
+            })
+            region_edges = sorted({
+                edge
+                for face in component_faces
+                for edge in (
+                    tuple(sorted((int(face[0]), int(face[1])))),
+                    tuple(sorted((int(face[1]), int(face[2])))),
+                    tuple(sorted((int(face[2]), int(face[0])))),
+                )
+                if edge[0] not in component_vertices or edge[1] not in component_vertices
+            })
+            if len(region_vertices) >= 3:
+                boundary_regions.append({"vertices": region_vertices, "edges": region_edges})
         kept_vertices = np.unique(faces[face_keep]) if np.any(face_keep) else np.empty(0, dtype=np.int64)
         remap = np.full(len(vertices), -1, dtype=np.int64)
         remap[kept_vertices] = np.arange(len(kept_vertices), dtype=np.int64)
@@ -372,6 +428,18 @@ def remove_vertices_inside_masks(
         mesh._mask_hole_boundary_vertices = [
             int(remap[vertex]) for vertex in surviving_connected_vertices if remap[vertex] >= 0
         ]
+        mesh._mask_hole_boundary_regions = [
+            {
+                "vertices": [int(remap[vertex]) for vertex in region["vertices"] if remap[vertex] >= 0],
+                "edges": [
+                    (int(remap[first]), int(remap[second]))
+                    for first, second in region["edges"]
+                    if remap[first] >= 0 and remap[second] >= 0
+                ],
+            }
+            for region in boundary_regions
+        ]
+        mesh._mask_hole_removed_patches = removed_patches
         if old_uv is not None and len(old_uv) == len(vertices):
             mesh.visual = trimesh.visual.texture.TextureVisuals(
                 uv=np.asarray(old_uv)[kept_vertices], material=old_material
@@ -391,83 +459,71 @@ def remove_vertices_inside_masks(
 def retile_mesh_holes(
     meshes: list[Any], flat_color: tuple[int, int, int, int] = (180, 180, 180, 255)
 ) -> tuple[list[Any], int]:
-    """Fill mask-created Open3D boundary loops with flat-color meshes."""
+    """Fill every mask-created removed-face region with Open3D patch meshes."""
     flat_meshes = []
     added_triangles = 0
     for mesh in meshes:
         if not len(mesh.faces):
             continue
-        boundary_vertices = set(getattr(mesh, "_mask_hole_boundary_vertices", []))
-        if len(boundary_vertices) < 3:
+        removed_patches = getattr(mesh, "_mask_hole_removed_patches", [])
+        if removed_patches:
+            for patch in removed_patches:
+                open3d_patch = o3d.geometry.TriangleMesh(
+                    o3d.utility.Vector3dVector(np.asarray(patch["vertices"], dtype=np.float64)),
+                    o3d.utility.Vector3iVector(np.asarray(patch["faces"], dtype=np.int32)),
+                )
+                open3d_patch.remove_degenerate_triangles()
+                open3d_patch.remove_duplicated_triangles()
+                open3d_patch.compute_vertex_normals()
+                flat_meshes.append(trimesh.Trimesh(
+                    vertices=np.asarray(open3d_patch.vertices),
+                    faces=np.asarray(open3d_patch.triangles, dtype=np.int64),
+                    vertex_colors=np.tile(
+                        np.asarray(flat_color, dtype=np.uint8),
+                        (len(open3d_patch.vertices), 1),
+                    ),
+                    process=False,
+                ))
+                added_triangles += len(open3d_patch.triangles)
             continue
-        open3d_mesh = o3d.geometry.TriangleMesh(
-            o3d.utility.Vector3dVector(np.asarray(mesh.vertices)),
-            o3d.utility.Vector3iVector(np.asarray(mesh.faces, dtype=np.int32)),
-        )
-        try:
-            half_edges = o3d.geometry.HalfEdgeTriangleMesh.create_from_triangle_mesh(open3d_mesh)
-            boundary_loops = [[int(index) for index in loop] for loop in half_edges.get_boundaries()]
-        except RuntimeError:
-            edge_array = np.asarray(mesh.edges_unique, dtype=np.int64)
-            edge_counts = np.bincount(
-                np.asarray(mesh.edges_unique_inverse, dtype=np.int64), minlength=len(edge_array)
+        regions = getattr(mesh, "_mask_hole_boundary_regions", [])
+        if not regions:
+            regions = [{"vertices": getattr(mesh, "_mask_hole_boundary_vertices", [])}]
+        for region in regions:
+            vertex_indices = np.asarray(sorted(set(region.get("vertices", []))), dtype=np.int64)
+            if len(vertex_indices) < 3:
+                continue
+            region_vertices = np.asarray(mesh.vertices)[vertex_indices]
+            center = region_vertices.mean(axis=0)
+            _, _, basis = np.linalg.svd(region_vertices - center, full_matrices=False)
+            coordinates_2d = (region_vertices - center) @ basis[:2].T
+            order = sorted(
+                range(len(coordinates_2d)),
+                key=lambda index: (coordinates_2d[index, 0], coordinates_2d[index, 1]),
             )
-            boundary_edges = edge_array[edge_counts == 1]
-            adjacency: dict[int, set[int]] = {}
-            for first, second in boundary_edges:
-                adjacency.setdefault(int(first), set()).add(int(second))
-                adjacency.setdefault(int(second), set()).add(int(first))
-            boundary_loops = []
-            remaining_vertices = set(adjacency)
-            while remaining_vertices:
-                start = min(remaining_vertices)
-                component = {start}
-                pending = [start]
-                while pending:
-                    current = pending.pop()
-                    for neighbor in adjacency[current]:
-                        if neighbor not in component:
-                            component.add(neighbor)
-                            pending.append(neighbor)
-                remaining_vertices.difference_update(component)
-                if len(component & boundary_vertices) < 2:
-                    continue
-                if any(len(adjacency[index]) != 2 for index in component):
-                    continue
-                loop = [start]
-                previous = -1
-                current = start
-                while True:
-                    candidates = [index for index in adjacency[current] if index != previous]
-                    next_index = candidates[0]
-                    if next_index == start:
+            hull: list[int] = []
+            for index in order + order[::-1]:
+                while len(hull) >= 2:
+                    first = coordinates_2d[hull[-2]]
+                    second = coordinates_2d[hull[-1]]
+                    third = coordinates_2d[index]
+                    cross = (second[0] - first[0]) * (third[1] - first[1]) - (second[1] - first[1]) * (third[0] - first[0])
+                    if cross > 1e-9:
                         break
-                    loop.append(next_index)
-                    previous, current = current, next_index
-                    if len(loop) > len(component):
-                        loop = []
-                        break
-                if len(loop) >= 3:
-                    boundary_loops.append(loop)
-        for boundary_loop in boundary_loops:
-            loop = [int(index) for index in boundary_loop]
-            if len(loop) < 3 or len(set(loop) & boundary_vertices) < 2:
+                    hull.pop()
+                hull.append(index)
+            hull = hull[:-1]
+            if len(hull) < 3:
                 continue
-            loop_vertices = np.asarray(open3d_mesh.vertices)[np.asarray(loop, dtype=np.int64)]
-            if len(np.unique(loop_vertices, axis=0)) < 3:
-                continue
-            center = loop_vertices.mean(axis=0)
-            _, _, basis = np.linalg.svd(loop_vertices - center, full_matrices=False)
-            coordinates_2d = (loop_vertices - center) @ basis[:2].T
             indices = mapbox_earcut.triangulate_float64(
-                coordinates_2d, np.asarray([len(coordinates_2d)], dtype=np.uint32)
+                coordinates_2d[np.asarray(hull)], np.asarray([len(hull)], dtype=np.uint32)
             )
             if not len(indices):
                 continue
-            flat_faces = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
+            flat_vertices = region_vertices[np.asarray(hull)]
             open3d_patch = o3d.geometry.TriangleMesh(
-                o3d.utility.Vector3dVector(loop_vertices),
-                o3d.utility.Vector3iVector(flat_faces),
+                o3d.utility.Vector3dVector(flat_vertices),
+                o3d.utility.Vector3iVector(np.asarray(indices, dtype=np.int64).reshape(-1, 3)),
             )
             open3d_patch.compute_vertex_normals()
             flat_meshes.append(trimesh.Trimesh(
