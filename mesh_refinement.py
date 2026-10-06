@@ -49,7 +49,7 @@ def load_relative_depth(
     depth_path: Path,
     capture_size: dict[str, Any],
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Load Depth Anything's normalized map and resize it to the capture frame."""
+    """Load and normalize a relative depth image for the capture frame."""
     with Image.open(depth_path) as image:
         source = np.asarray(image.convert("I"), dtype=np.float32)
     source_min = float(np.nanmin(source))
@@ -63,7 +63,7 @@ def load_relative_depth(
     depth = np.asarray(resized, dtype=np.float32)
     gradient_y, gradient_x = np.gradient(depth)
     gradient = np.hypot(gradient_x, gradient_y)
-    metadata = {
+    return depth, {
         "file": depth_path.name,
         "source_dimensions": {"width": int(source.shape[1]), "height": int(source.shape[0])},
         "projection_dimensions": {"width": target_size[0], "height": target_size[1]},
@@ -71,7 +71,6 @@ def load_relative_depth(
         "gradient_percentile": float(np.percentile(gradient, DEPTH_EDGE_PERCENTILE)),
         "relative_only": True,
     }
-    return depth, metadata
 
 
 def sample_relative_depth(
@@ -84,14 +83,10 @@ def sample_relative_depth(
     gradient = np.hypot(gradient_x, gradient_y)
     evidence = []
     for record in face_records:
-        triangle_values = record.get("triangle_pixels")
-        if triangle_values is None:
-            triangle_values = [record["pixel"]] * 3
+        triangle_values = record.get("triangle_pixels") or [record["pixel"]] * 3
         samples = _triangle_samples(np.asarray(triangle_values, dtype=float))
-        valid = (
-            (samples[:, 0] >= 0) & (samples[:, 0] < width) &
-            (samples[:, 1] >= 0) & (samples[:, 1] < height)
-        )
+        valid = ((samples[:, 0] >= 0) & (samples[:, 0] < width) &
+            (samples[:, 1] >= 0) & (samples[:, 1] < height))
         if not np.any(valid):
             continue
         pixels = samples[valid].astype(int)
@@ -366,13 +361,6 @@ def remove_vertices_inside_masks(
             component_vertices = set(int(vertex) for vertex in component_faces.reshape(-1))
             patch_indices = np.asarray(sorted(component_vertices), dtype=np.int64)
             patch_remap = {int(vertex): index for index, vertex in enumerate(patch_indices)}
-            removed_patches.append({
-                "vertices": vertices[patch_indices].tolist(),
-                "faces": [
-                    [patch_remap[int(vertex)] for vertex in face]
-                    for face in component_faces
-                ],
-            })
             region_vertices = sorted({
                 int(vertex)
                 for removed_vertex in component_vertices
@@ -390,6 +378,15 @@ def remove_vertices_inside_masks(
                     tuple(sorted((int(face[2]), int(face[0])))),
                 )
                 if edge[0] not in component_vertices or edge[1] not in component_vertices
+            })
+            removed_patches.append({
+                "vertices": vertices[patch_indices].tolist(),
+                "faces": [
+                    [patch_remap[int(vertex)] for vertex in face]
+                    for face in component_faces
+                ],
+                "boundary_vertices": vertices[np.asarray(region_vertices, dtype=np.int64)].tolist()
+                if len(region_vertices) >= 3 else vertices[patch_indices].tolist(),
             })
             if len(region_vertices) >= 3:
                 boundary_regions.append({"vertices": region_vertices, "edges": region_edges})
@@ -472,6 +469,15 @@ def retile_mesh_holes(
                     o3d.utility.Vector3dVector(np.asarray(patch["vertices"], dtype=np.float64)),
                     o3d.utility.Vector3iVector(np.asarray(patch["faces"], dtype=np.int32)),
                 )
+                patch_vertices = np.asarray(patch["vertices"], dtype=np.float64)
+                plane_points = np.asarray(patch["boundary_vertices"], dtype=np.float64)
+                plane_center = plane_points.mean(axis=0)
+                _, _, plane_basis = np.linalg.svd(plane_points - plane_center, full_matrices=False)
+                plane_normal = plane_basis[-1]
+                flattened_vertices = patch_vertices - (
+                    (patch_vertices - plane_center) @ plane_normal
+                )[:, None] * plane_normal
+                open3d_patch.vertices = o3d.utility.Vector3dVector(flattened_vertices)
                 open3d_patch.remove_degenerate_triangles()
                 open3d_patch.remove_duplicated_triangles()
                 open3d_patch.compute_vertex_normals()
@@ -617,95 +623,118 @@ def apply_conservative_geometry_refinement(
     return changes
 
 
-def smooth_masked_road(
+def regularize_masked_buildings(
     meshes: list[Any],
-    road_masks: list[dict[str, Any]],
-    iterations: int = 3,
-    strength: float = 0.45,
+    building_faces: set[tuple[int, int]],
+    face_records: list[dict[str, Any]],
+    line_map: np.ndarray,
+    aggression: float = 0.5,
 ) -> list[dict[str, Any]]:
-    """Laplacian-smooth Mask2Former road vertices while preserving road boundaries."""
-    selected = set()
-    for mask in road_masks:
-        if "mask2former_road" not in str(mask.get("file", "")).lower():
+    """Regularize the nearest visible building component and reduce its interior triangles."""
+    aggression = float(np.clip(aggression, 0.0, 1.0))
+    if not building_faces:
+        return []
+    records = {(int(item["mesh_index"]), int(item["face_index"])): item for item in face_records}
+    components = _face_components(meshes, building_faces)
+    if not components:
+        return []
+    component_scores = []
+    for mesh_index, face_indices in components:
+        component_mesh_faces = np.asarray(meshes[mesh_index].faces, dtype=np.int64)
+        component_triangles = component_mesh_faces[face_indices]
+        component_vertices = set(np.unique(component_triangles).tolist())
+        component_edges: dict[tuple[int, int], int] = {}
+        for triangle in component_triangles:
+            for first, second in ((triangle[0], triangle[1]), (triangle[1], triangle[2]), (triangle[2], triangle[0])):
+                edge = tuple(sorted((int(first), int(second))))
+                component_edges[edge] = component_edges.get(edge, 0) + 1
+        perimeter = {vertex for edge, count in component_edges.items() if count == 1 for vertex in edge}
+        if len(component_vertices - perimeter) < 3:
             continue
-        selected.update(
-            (int(face[0]), int(face[1]))
-            for face in mask.get("selected_faces", [])
-            if isinstance(face, (list, tuple)) and len(face) == 2
-        )
-    if not selected:
+        depths = [float(records[(mesh_index, face_index)]["depth"]) for face_index in face_indices if (mesh_index, face_index) in records]
+        component_scores.append((float(np.mean(depths)) if depths else float("inf"), mesh_index, face_indices))
+    if not component_scores:
+        return []
+    _, mesh_index, face_indices = min(component_scores)
+    mesh = meshes[mesh_index]
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    component_vertices = set(np.unique(faces[face_indices]).tolist())
+    selected_edge_counts: dict[tuple[int, int], int] = {}
+    for face_index in face_indices:
+        face = faces[face_index]
+        for first, second in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
+            edge = tuple(sorted((int(first), int(second))))
+            selected_edge_counts[edge] = selected_edge_counts.get(edge, 0) + 1
+    perimeter = {vertex for edge, count in selected_edge_counts.items() if count == 1 for vertex in edge}
+    interior = sorted(component_vertices - perimeter)
+    if len(interior) < 3:
         return []
 
-    changes = []
-    for mesh_index, face_indices in _face_components(meshes, selected):
-        mesh = meshes[mesh_index]
-        faces = np.asarray(mesh.faces, dtype=np.int64)
-        component_faces = np.asarray([faces[index] for index in face_indices], dtype=np.int64)
-        road_vertices = set(np.unique(component_faces).tolist())
-        selected_face_set = set(face_indices)
-        vertex_faces: dict[int, set[int]] = {}
-        all_vertex_faces: dict[int, set[int]] = {}
-        selected_edge_counts: dict[tuple[int, int], int] = {}
-        for face_index, face in enumerate(faces):
-            for vertex_index in face:
-                all_vertex_faces.setdefault(int(vertex_index), set()).add(face_index)
-        for face_index in face_indices:
-            face = faces[face_index]
-            for vertex_index in face:
-                vertex_faces.setdefault(int(vertex_index), set()).add(int(face_index))
-            for first, second in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
-                edge = tuple(sorted((int(first), int(second))))
-                selected_edge_counts[edge] = selected_edge_counts.get(edge, 0) + 1
-            perimeter_vertices = {
-                vertex_index
-                for edge, count in selected_edge_counts.items()
-                if count == 1
-                for vertex_index in edge
-            }
-        boundary_vertices = {
-            vertex_index
-            for vertex_index, adjacent_faces in vertex_faces.items()
-            if vertex_index in perimeter_vertices
-            or bool(all_vertex_faces[vertex_index] - selected_face_set)
-        }
-        # Boundary vertices are fixed so the road remains attached to its neighbors.
-        interior_vertices = sorted(road_vertices - boundary_vertices)
-        if not interior_vertices:
+    original = np.asarray(mesh.vertices, dtype=np.float64).copy()
+    points = original[sorted(component_vertices)]
+    center = points.mean(axis=0)
+    horizontal = points[:, [0, 2]] - center[[0, 2]]
+    _, _, vectors = np.linalg.svd(horizontal, full_matrices=False)
+    basis = np.column_stack((vectors[0], vectors[1]))
+    coordinates = (original[:, [0, 2]] - center[[0, 2]]) @ basis
+    updated = original.copy()
+    for vertex_index in interior:
+        adjacent = np.unique(faces[[face_index for face_index in face_indices if vertex_index in faces[face_index]]])
+        adjacent = [int(index) for index in adjacent if int(index) in component_vertices and int(index) != vertex_index]
+        if not adjacent:
             continue
-        neighbors: dict[int, set[int]] = {vertex_index: set() for vertex_index in interior_vertices}
-        for triangle in component_faces:
-            for vertex_index in triangle:
-                if int(vertex_index) not in neighbors:
-                    continue
-                neighbors[int(vertex_index)].update(
-                    int(other) for other in triangle if int(other) != int(vertex_index)
-                )
-        original = np.asarray(mesh.vertices, dtype=np.float64).copy()
-        updated = original.copy()
-        for _ in range(max(1, int(iterations))):
-            previous = updated.copy()
-            for vertex_index in interior_vertices:
-                adjacent = sorted(neighbors[vertex_index])
-                if adjacent:
-                    average = previous[adjacent].mean(axis=0)
-                    updated[vertex_index] = previous[vertex_index] * (1.0 - strength) + average * strength
-        mesh.vertices[:] = updated
-        moved = np.linalg.norm(updated - original, axis=1)
-        moved_mask = np.asarray([moved[index] > 1e-8 for index in interior_vertices])
-        if np.any(moved_mask):
-            changes.append({
-                "region": "road",
-                "mesh_index": int(mesh_index),
-                "face_count": len(face_indices),
-                "vertex_count": len(road_vertices),
-                "interior_vertex_count": len(interior_vertices),
-                "boundary_vertex_count": len(boundary_vertices),
-                "moved_vertex_count": int(np.count_nonzero(moved_mask)),
-                "max_displacement": float(moved[interior_vertices].max()),
-                "iterations": int(iterations),
-                "boundary_vertices_preserved": True,
-            })
-    return changes
+        neighbor_coordinates = coordinates[adjacent]
+        neighbor_heights = original[adjacent, 1]
+        blend = 0.35 - aggression * 0.30
+        coordinates[vertex_index] = coordinates[vertex_index] * blend + np.median(neighbor_coordinates, axis=0) * (1.0 - blend)
+        updated[vertex_index, 1] = original[vertex_index, 1] * blend + float(np.median(neighbor_heights)) * (1.0 - blend)
+        updated[vertex_index, [0, 2]] = coordinates[vertex_index] @ basis.T + center[[0, 2]]
+
+    mesh.vertices[:] = updated
+    component_extent = max(float(np.max(np.ptp(points, axis=0))), 1e-5)
+    cluster_size = component_extent * (0.08 + aggression * 0.22)
+    cluster_keys: dict[tuple[int, int, int], int] = {}
+    vertex_map = {index: index for index in range(len(original))}
+    for vertex_index in interior:
+        key = tuple(np.rint(updated[vertex_index] / cluster_size).astype(int).tolist())
+        representative = cluster_keys.setdefault(key, vertex_index)
+        vertex_map[vertex_index] = representative
+    mapped_faces = faces.copy()
+    for face_index in face_indices:
+        mapped_faces[face_index] = [vertex_map[int(index)] for index in faces[face_index]]
+    keep = np.ones(len(faces), dtype=bool)
+    seen: set[tuple[int, int, int]] = set()
+    for face_index in face_indices:
+        mapped = tuple(int(index) for index in mapped_faces[face_index])
+        if len(set(mapped)) < 3 or tuple(sorted(mapped)) in seen:
+            keep[face_index] = False
+        else:
+            seen.add(tuple(sorted(mapped)))
+    mesh.faces = mapped_faces
+    mesh.update_faces(keep)
+    edge_score = 0.0
+    for face_index in face_indices:
+        record = records.get((mesh_index, face_index))
+        if record is None:
+            continue
+        pixels = np.asarray(record.get("triangle_pixels", [record["pixel"]]), dtype=float).astype(int)
+        valid = (pixels[:, 0] >= 0) & (pixels[:, 0] < line_map.shape[1]) & (pixels[:, 1] >= 0) & (pixels[:, 1] < line_map.shape[0])
+        if np.any(valid):
+            edge_score += float(np.mean(line_map[pixels[valid, 1], pixels[valid, 0]] > 0))
+    return [{
+        "region": "building",
+        "mesh_index": int(mesh_index),
+        "selected_face_count": len(face_indices),
+        "remaining_face_count": int(np.count_nonzero(keep[face_indices])),
+        "polygon_reduction": int(len(face_indices) - np.count_nonzero(keep[face_indices])),
+        "vertex_count": len(component_vertices),
+        "interior_vertex_count": len(interior),
+        "boundary_vertex_count": len(perimeter),
+        "boundary_vertices_preserved": True,
+        "mlsd_line_score": edge_score / max(len(face_indices), 1),
+        "axis_alignment": "dominant horizontal PCA axes with median-height horizontal bands",
+        "aggression": aggression,
+    }]
 
 
 def regularize_masked_buildings(

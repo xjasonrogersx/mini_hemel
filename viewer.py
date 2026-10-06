@@ -4,7 +4,6 @@ from pathlib import Path
 from datetime import datetime
 import base64
 import boto3
-import copy
 import hashlib
 import io
 import json
@@ -26,11 +25,12 @@ import trimesh
 from botocore.config import Config
 from PIL import Image, ImageOps
 from web_server import ViewerWebServer
+from building_regularization import regularize_masked_buildings
+from road_smoothing import smooth_masked_road
+from texture_reprojection import apply_view_projected_texture
 from mesh_refinement import (
 	load_relative_depth,
 	apply_conservative_geometry_refinement,
-	regularize_masked_buildings,
-	smooth_masked_road,
 	project_points,
 	project_scene_faces,
 	sample_mask,
@@ -82,7 +82,8 @@ def load_scene(
 	texture_path: Path | None = None,
 	camera_pose: dict[str, object] | None = None,
 ) -> tuple[pyrender.Scene, pyrender.PerspectiveCamera]:
-	loaded = trimesh.load(asset_path, file_type="gltf", force="scene")
+	file_type = "glb" if asset_path.suffix.lower() == ".glb" else "gltf"
+	loaded = trimesh.load(asset_path, file_type=file_type, force="scene")
 	if not isinstance(loaded, trimesh.Scene):
 		loaded = trimesh.Scene(loaded)
 
@@ -102,41 +103,10 @@ def load_scene(
 		capture_size = camera_pose.get("capture_size", {})
 		if not isinstance(capture_size, dict) or "width" not in capture_size or "height" not in capture_size:
 			raise ValueError("capture size is required for a view-projected texture")
-		texture = Image.open(texture_path).convert("RGB").resize(
-			(int(capture_size["width"]), int(capture_size["height"])),
-			resample=Image.Resampling.LANCZOS,
+		meshes, projected_visible_faces = apply_view_projected_texture(
+			loaded, texture_path, camera_pose, capture_size
 		)
-		projection_records = project_scene_faces(loaded, camera_pose, capture_size)
-		visible_keys = visible_face_keys(projection_records, capture_size)
-		projected_meshes = []
-		for mesh_index, mesh in enumerate(meshes):
-			visible_faces = [
-				face_index for face_index in range(len(mesh.faces))
-				if (mesh_index, face_index) in visible_keys
-			]
-			occluded_faces = [
-				face_index for face_index in range(len(mesh.faces))
-				if (mesh_index, face_index) not in visible_keys
-			]
-			if occluded_faces:
-				projected_meshes.append(mesh.submesh([occluded_faces], append=True, repair=False))
-			if not visible_faces:
-				continue
-			visible_mesh = mesh.submesh([visible_faces], append=True, repair=False)
-			pixels, _depths = project_points(
-				np.asarray(visible_mesh.vertices), camera_pose["matrix"], capture_size
-			)
-			visible_mesh.visual.uv = np.column_stack((
-				np.clip(pixels[:, 0] / float(capture_size["width"]), 0.0, 1.0),
-				np.clip(1.0 - pixels[:, 1] / float(capture_size["height"]), 0.0, 1.0),
-			))
-			material = getattr(visible_mesh.visual, "material", None)
-			if material is not None and hasattr(material, "baseColorTexture"):
-				visible_mesh.visual.material = copy.deepcopy(material)
-				visible_mesh.visual.material.baseColorTexture = texture
-			projected_meshes.append(visible_mesh)
-		meshes = projected_meshes
-		render_scene._projected_visible_faces = len(visible_keys)
+		render_scene._projected_visible_faces = projected_visible_faces
 		render_scene._projected_total_faces = sum(len(mesh.faces) for mesh in meshes)
 	render_scene.add(pyrender.Mesh.from_trimesh(meshes, smooth=False))
 	render_scene._walk_meshes = meshes
@@ -293,12 +263,16 @@ class ModelWindow(pyglet.window.Window):
 			self.navigate_to_artifact(int(command["index"]))
 		elif action == "view_refined":
 			self.view_refined_artifact(int(command["index"]))
+		elif action == "view_road_smoothed":
+			self.view_asset_with_texture(int(command["index"]), "road_smoothing_asset", "road-smoothed")
 		elif action == "load_road_smoothed":
 			self.load_processed_artifact(int(command["index"]), "road_smoothing_asset", "road-smoothed")
 		elif action == "load_road_mask_vertex_removal":
 			self.load_processed_artifact(int(command["index"]), "road_mask_vertex_removal_asset", "road-mask vertex removal")
 		elif action == "load_road_mask_retiling":
 			self.load_road_mask_retiling(int(command["index"]))
+		elif action == "view_road_mask_retiling":
+			self.view_asset_with_texture(int(command["index"]), "road_mask_vertex_retiling_asset", "road-mask retiling")
 		elif action == "load_buildings_regularized":
 			self.load_processed_artifact(int(command["index"]), "building_regularization_asset", "building-regularized")
 		elif action == "segment":
@@ -385,19 +359,24 @@ class ModelWindow(pyglet.window.Window):
 		self.set_caption(f"Navigated to artifact {index + 1}")
 
 	def view_refined_artifact(self, index: int) -> None:
+		self.view_asset_with_texture(index, "refined_asset", "refined")
+
+	def view_asset_with_texture(self, index: int, asset_field: str, label: str) -> None:
 		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
 			artifacts = json.load(artifacts_file)
 		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
 			raise ValueError("artifact index is out of range")
 		artifact = artifacts[index]
-		asset_name = artifact.get("refined_asset")
+		asset_name = artifact.get(asset_field)
 		texture_name = artifact.get("result_render")
 		if not asset_name or not texture_name:
-			raise ValueError("artifact has no refined asset and generated result texture")
+			raise ValueError(f"artifact has no {label} asset and generated result texture")
 		asset_path = CAPTURES_PATH / str(asset_name)
 		texture_path = CAPTURES_PATH / str(texture_name)
 		if not asset_path.is_file() or not texture_path.is_file():
 			raise ValueError("refined asset or generated result texture does not exist")
+		if asset_path.suffix.lower() != ".glb":
+			raise ValueError(f"legacy {label} GLTF detected; rerun {label} processing to create a deployable GLB")
 		new_scene, new_camera = load_scene(
 			asset_path, texture_path=texture_path, camera_pose=artifact.get("camera_pose")
 		)
@@ -413,7 +392,7 @@ class ModelWindow(pyglet.window.Window):
 		self.distance = new_scene._orbit_extent * 2.4
 		self.update_camera()
 		self.navigate_to_artifact(index)
-		self.set_caption(f"Refined texture viewed for artifact {index + 1}")
+		self.set_caption(f"Generated texture viewed on {label} mesh for artifact {index + 1}")
 
 	def load_processed_artifact(self, index: int, asset_field: str, label: str) -> None:
 		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
@@ -555,11 +534,11 @@ class ModelWindow(pyglet.window.Window):
 			)
 			if stats["vertices_removed"] == 0:
 				raise ValueError("road mask contains no projected mesh vertices")
-			output_name = f"road_mask_vertices_removed_{index}.gltf"
-			trimesh.Scene(meshes).export(CAPTURES_PATH / output_name, file_type="gltf")
+			output_name = f"road_mask_vertices_removed_{index}.glb"
+			trimesh.Scene(meshes).export(CAPTURES_PATH / output_name, file_type="glb")
 			retiled_meshes, added_triangles = retile_mesh_holes(meshes)
-			retiled_output_name = f"road_mask_vertices_retiled_{index}.gltf"
-			trimesh.Scene(retiled_meshes).export(CAPTURES_PATH / retiled_output_name, file_type="gltf")
+			retiled_output_name = f"road_mask_vertices_retiled_{index}.glb"
+			trimesh.Scene(retiled_meshes).export(CAPTURES_PATH / retiled_output_name, file_type="glb")
 			stats["triangles_added"] = added_triangles
 			LOGGER.info(
 				"Road mask retiling: artifact=%d new_flat_triangles=%d output=%s",
@@ -676,9 +655,9 @@ class ModelWindow(pyglet.window.Window):
 				removed_triangle_count,
 				modified_triangle_count,
 			)
-			output_name = f"road_smoothed_{index}.gltf"
+			output_name = f"road_smoothed_{index}.glb"
 			output_path = CAPTURES_PATH / output_name
-			trimesh.Scene(meshes).export(output_path, file_type="gltf")
+			trimesh.Scene(meshes).export(output_path, file_type="glb")
 			with ARTIFACTS_LOCK:
 				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
 					artifacts = json.load(artifacts_file)
@@ -937,7 +916,7 @@ class ModelWindow(pyglet.window.Window):
 				})
 			sidecar_name = f"refinement_{index}.json"
 			sidecar_path = CAPTURES_PATH / sidecar_name
-			refined_name = f"refined_{index}.gltf"
+			refined_name = f"refined_{index}.glb"
 			refined_path = CAPTURES_PATH / refined_name
 			source_hash = hashlib.sha256(ASSET_PATH.read_bytes()).hexdigest()
 			face_records = project_scene_faces(loaded, camera_pose, capture_size)
@@ -980,7 +959,7 @@ class ModelWindow(pyglet.window.Window):
 				)
 			LOGGER.info("Mesh refinement geometry pass complete: artifact=%d changes=%d visible_faces=%d", index, len(geometry_changes), len(visible_face_keys_set))
 			refined_scene = trimesh.Scene(meshes)
-			refined_scene.export(refined_path, file_type="gltf")
+			refined_scene.export(refined_path, file_type="glb")
 			sidecar = {
 				"version": 1,
 				"status": "refined" if geometry_changes else "depth_analyzed",
