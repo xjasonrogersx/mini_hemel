@@ -16,9 +16,33 @@ The workers use separate queues so they can run independently:
 | Depth Anything V2 | `depth_anything_worker.py` | `depth-anything` | 16-bit depth PNG |
 | SegFormer ADE20K | `segformer_worker.py` | `segformer` | Semantic label map and masks |
 | Mask2Former ADE20K | `mask2former_worker.py` | `mask2former` | Semantic label map and masks |
+| M-LSD line detection | `mlsd_worker.py` | `mlsd` | Model-produced line map |
 | Grounding DINO | `grounding_dino_worker.py` | `grounding-dino` | Text-prompted bounding boxes |
 | Ultralytics SAM3 | `sam3_worker.py` | `sam3` | Detection metadata and masks |
 | Ultralytics SAM2 | `sam2_worker.py` | `sam2` | Detection metadata and masks |
+
+### M-LSD line detection
+
+The M-LSD worker uses the PyTorch implementation and checkpoint from
+`lhwcv/mlsd_pytorch`. Set up the model server once:
+
+```bash
+git clone https://github.com/lhwcv/mlsd_pytorch.git /workspace/mlsd_pytorch
+mkdir -p /workspace/mlsd_pytorch/models
+wget -O /workspace/mlsd_pytorch/models/mlsd_large_512_fp32.pth \
+	https://github.com/lhwcv/mlsd_pytorch/raw/main/models/mlsd_large_512_fp32.pth
+```
+
+Start the RabbitMQ worker from this repository:
+
+```bash
+python3 model_server/mlsd_worker.py \
+	--model /workspace/mlsd_pytorch/models/mlsd_large_512_fp32.pth \
+	--source-dir /workspace/mlsd_pytorch \
+	--queue mlsd \
+	--input-size 512 \
+	--rabbitmq-url 'amqp://guest:guest@192.168.1.220:5672/%2F'
+```
 
 ### Flux depth ControlNet
 

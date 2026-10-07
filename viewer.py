@@ -4,6 +4,7 @@ from pathlib import Path
 from datetime import datetime
 import base64
 import boto3
+import hashlib
 import io
 import json
 import logging
@@ -11,6 +12,7 @@ import math
 import os
 import queue
 import requests
+import shutil
 import threading
 import time
 import uuid
@@ -23,6 +25,20 @@ import trimesh
 from botocore.config import Config
 from PIL import Image, ImageOps
 from web_server import ViewerWebServer
+from building_regularization import regularize_masked_buildings
+from road_smoothing import smooth_masked_road
+from texture_reprojection import apply_view_projected_texture
+from mesh_refinement import (
+	load_relative_depth,
+	apply_conservative_geometry_refinement,
+	project_points,
+	project_scene_faces,
+	sample_mask,
+	sample_relative_depth,
+	visible_face_keys,
+	remove_vertices_inside_masks,
+	retile_mesh_holes,
+)
 
 
 ASSET_PATH = Path(__file__).with_name("merged.gltf")
@@ -61,8 +77,13 @@ WEB_PORT = int(os.getenv("VIEWER_WEB_PORT", "8765"))
 LOGGER = logging.getLogger(__name__)
 
 
-def load_scene(asset_path: Path) -> tuple[pyrender.Scene, pyrender.PerspectiveCamera]:
-	loaded = trimesh.load(asset_path, file_type="gltf", force="scene")
+def load_scene(
+	asset_path: Path,
+	texture_path: Path | None = None,
+	camera_pose: dict[str, object] | None = None,
+) -> tuple[pyrender.Scene, pyrender.PerspectiveCamera]:
+	file_type = "glb" if asset_path.suffix.lower() == ".glb" else "gltf"
+	loaded = trimesh.load(asset_path, file_type=file_type, force="scene")
 	if not isinstance(loaded, trimesh.Scene):
 		loaded = trimesh.Scene(loaded)
 
@@ -76,12 +97,28 @@ def load_scene(asset_path: Path) -> tuple[pyrender.Scene, pyrender.PerspectiveCa
 		ambient_light=[1.0, 1.0, 1.0],
 	)
 	meshes = loaded.dump(concatenate=False)
+	if texture_path is not None:
+		if camera_pose is None or "matrix" not in camera_pose:
+			raise ValueError("camera pose is required for a view-projected texture")
+		capture_size = camera_pose.get("capture_size", {})
+		if not isinstance(capture_size, dict) or "width" not in capture_size or "height" not in capture_size:
+			raise ValueError("capture size is required for a view-projected texture")
+		meshes, projected_visible_faces = apply_view_projected_texture(
+			loaded, texture_path, camera_pose, capture_size
+		)
+		render_scene._projected_visible_faces = projected_visible_faces
+		render_scene._projected_total_faces = sum(len(mesh.faces) for mesh in meshes)
 	render_scene.add(pyrender.Mesh.from_trimesh(meshes, smooth=False))
 	render_scene._walk_meshes = meshes
 
 	camera = pyrender.PerspectiveCamera(
 		yfov=math.radians(45.0),
-		aspectRatio=WINDOW_WIDTH / WINDOW_HEIGHT,
+		aspectRatio=(
+			float(camera_pose["capture_size"]["width"])
+			/ float(camera_pose["capture_size"]["height"])
+			if texture_path is not None and camera_pose is not None
+			else WINDOW_WIDTH / WINDOW_HEIGHT
+		),
 		znear=max(extent * CAMERA_NEAR_RATIO, 0.001),
 		zfar=extent * CAMERA_FAR_RATIO,
 	)
@@ -106,6 +143,15 @@ class ModelWindow(pyglet.window.Window):
 		self.camera = camera
 		self.renderer = pyrender.OffscreenRenderer(WINDOW_WIDTH, WINDOW_HEIGHT)
 		self.mode = "textured"
+		self.use_texture = True
+		self.show_edges = False
+		self.show_visible_faces = False
+		self._material_state = {}
+		self._visible_face_cache_key = None
+		self._visible_face_triangles = []
+		self._visible_face_base_meshes = None
+		self._edge_overlay = None
+		self._edge_cache_key = None
 		self.yaw = math.radians(35.0)
 		self.pitch = math.radians(18.0)
 		self.distance = render_scene._orbit_extent * 2.4
@@ -131,6 +177,7 @@ class ModelWindow(pyglet.window.Window):
 		texture_config.pop("key", None)
 		return {
 			"mode": self.mode,
+			"show_edges": self.show_edges,
 			"walk_mode": self.walk_mode,
 			"yaw": self.yaw,
 			"pitch": self.pitch,
@@ -184,6 +231,13 @@ class ModelWindow(pyglet.window.Window):
 				raise ValueError("mode must be textured or depth")
 			self.mode = str(mode)
 			self.set_caption(f"merged.gltf | {self.mode}")
+		elif action == "toggle_edges":
+			self.show_edges = not self.show_edges
+			self.set_caption(f"merged.gltf | edges {'on' if self.show_edges else 'off'}")
+		elif action == "toggle_visible_faces":
+			self.toggle_visible_face_colors()
+		elif action == "toggle_texture":
+			self.set_texture_mode(not self.use_texture)
 		elif action == "set_navigation":
 			navigation_mode = command.get("mode")
 			if navigation_mode == "walk" and not self.walk_mode:
@@ -207,10 +261,30 @@ class ModelWindow(pyglet.window.Window):
 			self.save_current_view()
 		elif action == "navigate":
 			self.navigate_to_artifact(int(command["index"]))
+		elif action == "view_refined":
+			self.view_refined_artifact(int(command["index"]))
+		elif action == "view_road_smoothed":
+			self.view_asset_with_texture(int(command["index"]), "road_smoothing_asset", "road-smoothed")
+		elif action == "load_road_smoothed":
+			self.load_processed_artifact(int(command["index"]), "road_smoothing_asset", "road-smoothed")
+		elif action == "load_road_mask_vertex_removal":
+			self.load_processed_artifact(int(command["index"]), "road_mask_vertex_removal_asset", "road-mask vertex removal")
+		elif action == "load_road_mask_retiling":
+			self.load_road_mask_retiling(int(command["index"]))
+		elif action == "view_road_mask_retiling":
+			self.view_asset_with_texture(int(command["index"]), "road_mask_vertex_retiling_asset", "road-mask retiling")
+		elif action == "load_buildings_regularized":
+			self.load_processed_artifact(int(command["index"]), "building_regularization_asset", "building-regularized")
 		elif action == "segment":
 			self.run_segmentation_for_artifact(int(command["index"]))
 		elif action == "mask2former":
 			self.run_mask2former_for_artifact(int(command["index"]))
+		elif action == "mlsd":
+			LOGGER.info("M-LSD web action dispatched: artifact=%s", command.get("index"))
+			self.run_mlsd_for_artifact(int(command["index"]))
+		elif action == "depth_anything":
+			LOGGER.info("Depth Anything web action dispatched: artifact=%s", command.get("index"))
+			self.run_depth_anything_for_artifact(int(command["index"]))
 		elif action == "grounding_dino":
 			self.run_grounding_dino_for_artifact(
 				int(command["index"]), str(command.get("prompt", "door"))
@@ -230,6 +304,22 @@ class ModelWindow(pyglet.window.Window):
 			self.delete_grounding_dino_detection(
 				int(command["index"]), str(command["prompt"]), int(command["detection_index"])
 			)
+		elif action == "refine_mesh":
+			LOGGER.info("Mesh refinement web action dispatched: artifact=%s", command.get("index"))
+			self.run_mesh_refinement(int(command["index"]))
+		elif action == "smooth_road":
+			LOGGER.info("Road smoothing web action dispatched: artifact=%s", command.get("index"))
+			self.run_road_smoothing(int(command["index"]))
+		elif action == "remove_road_mask_vertices":
+			LOGGER.info("Road mask vertex removal test dispatched: artifact=%s", command.get("index"))
+			self.run_road_mask_vertex_removal(
+				int(command["index"]),
+				include_road=bool(command.get("include_road", True)),
+				include_sidewalk=bool(command.get("include_sidewalk", False)),
+			)
+		elif action == "regularize_buildings":
+			LOGGER.info("Building regularization web action dispatched: artifact=%s", command.get("index"))
+			self.run_building_regularization(int(command["index"]), float(command.get("aggression", 0.5)))
 		elif action == "set_options":
 			self.update_texture_options(command.get("options", {}))
 		else:
@@ -268,6 +358,70 @@ class ModelWindow(pyglet.window.Window):
 		)
 		self.set_caption(f"Navigated to artifact {index + 1}")
 
+	def view_refined_artifact(self, index: int) -> None:
+		self.view_asset_with_texture(index, "refined_asset", "refined")
+
+	def view_asset_with_texture(self, index: int, asset_field: str, label: str) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		artifact = artifacts[index]
+		asset_name = artifact.get(asset_field)
+		texture_name = artifact.get("result_render")
+		if not asset_name or not texture_name:
+			raise ValueError(f"artifact has no {label} asset and generated result texture")
+		asset_path = CAPTURES_PATH / str(asset_name)
+		texture_path = CAPTURES_PATH / str(texture_name)
+		if not asset_path.is_file() or not texture_path.is_file():
+			raise ValueError("refined asset or generated result texture does not exist")
+		if asset_path.suffix.lower() != ".glb":
+			raise ValueError(f"legacy {label} GLTF detected; rerun {label} processing to create a deployable GLB")
+		new_scene, new_camera = load_scene(
+			asset_path, texture_path=texture_path, camera_pose=artifact.get("camera_pose")
+		)
+		self.render_scene = new_scene
+		self.camera = new_camera
+		self._material_state = {}
+		self._visible_face_cache_key = None
+		self._visible_face_base_meshes = None
+		self.show_visible_faces = False
+		if not self.use_texture:
+			self.set_texture_mode(False)
+		self.orbit_target = new_scene._orbit_center.copy()
+		self.distance = new_scene._orbit_extent * 2.4
+		self.update_camera()
+		self.navigate_to_artifact(index)
+		self.set_caption(f"Generated texture viewed on {label} mesh for artifact {index + 1}")
+
+	def load_processed_artifact(self, index: int, asset_field: str, label: str) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		artifact = artifacts[index]
+		asset_name = artifact.get(asset_field)
+		if not asset_name:
+			raise ValueError(f"artifact has no {label} mesh")
+		asset_path = CAPTURES_PATH / str(asset_name)
+		if not asset_path.is_file():
+			raise ValueError(f"{label} mesh does not exist")
+		LOGGER.info("Loading %s mesh without generated texture: artifact=%d asset=%s", label, index, asset_name)
+		new_scene, new_camera = load_scene(asset_path)
+		self.render_scene = new_scene
+		self.camera = new_camera
+		self._material_state = {}
+		self._visible_face_cache_key = None
+		self._visible_face_base_meshes = None
+		self.show_visible_faces = False
+		self.set_texture_mode(True)
+		LOGGER.info("Enabled embedded mesh textures for %s deployment; generated texture not applied", label)
+		self.orbit_target = new_scene._orbit_center.copy()
+		self.distance = new_scene._orbit_extent * 2.4
+		self.update_camera()
+		self.navigate_to_artifact(index)
+		self.set_caption(f"{label.capitalize()} mesh loaded for artifact {index + 1}")
+
 	def delete_grounding_dino_detection(self, index: int, prompt: str, detection_index: int) -> None:
 		with ARTIFACTS_LOCK:
 			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
@@ -290,6 +444,574 @@ class ModelWindow(pyglet.window.Window):
 			with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
 				json.dump(artifacts, artifacts_file, indent=2)
 		self.set_caption(f"Deleted Grounding DINO {prompt} detection {detection_index + 1}")
+
+	def run_mesh_refinement(self, index: int) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		threading.Thread(
+			target=self._run_mesh_refinement_worker,
+			args=(index,),
+			name=f"mesh-refinement-{index}",
+			daemon=True,
+		).start()
+		self.set_caption(f"Mesh refinement started for artifact {index + 1}")
+
+	def run_road_smoothing(self, index: int) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		threading.Thread(
+			target=self._run_road_smoothing_worker,
+			args=(index,),
+			name=f"road-smoothing-{index}",
+			daemon=True,
+		).start()
+		self.set_caption(f"Road smoothing started for artifact {index + 1}")
+
+	def run_road_mask_vertex_removal(
+		self, index: int, include_road: bool = True, include_sidewalk: bool = False
+	) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		with ARTIFACTS_LOCK:
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			artifacts[index]["road_mask_vertex_removal_status"] = "running"
+			artifacts[index].pop("road_mask_vertex_removal_asset", None)
+			artifacts[index].pop("road_mask_vertex_retiling_asset", None)
+			artifacts[index].pop("road_mask_vertex_removal_stats", None)
+			artifacts[index].pop("road_mask_vertex_removal_masks", None)
+			with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+				json.dump(artifacts, artifacts_file, indent=2)
+		threading.Thread(
+			target=self._run_road_mask_vertex_removal_worker,
+			args=(index, include_road, include_sidewalk),
+			name=f"road-mask-vertex-removal-{index}",
+			daemon=True,
+		).start()
+		self.set_caption(f"Road mask vertex removal test started for artifact {index + 1}")
+
+	def load_road_mask_retiling(self, index: int) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		if artifacts[index].get("road_mask_vertex_removal_status") != "completed":
+			raise ValueError("retiled mesh is not ready; wait for the mask removal test to finish")
+		self.load_processed_artifact(index, "road_mask_vertex_retiling_asset", "road-mask retiling")
+
+	def _run_road_mask_vertex_removal_worker(
+		self, index: int, include_road: bool, include_sidewalk: bool
+	) -> None:
+		try:
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			artifact = artifacts[index]
+			mask_names = [
+				CAPTURES_PATH / str(name)
+				for name in artifact.get("mask2former_masks", [])
+				if (
+					(include_road and "mask2former_road" in str(name).lower())
+					or (include_sidewalk and "mask2former_sidewalk" in str(name).lower())
+				)
+				and (CAPTURES_PATH / str(name)).is_file()
+			]
+			camera_pose = artifact.get("camera_pose", {})
+			capture_size = camera_pose.get("capture_size", {})
+			if not mask_names or "matrix" not in camera_pose or not capture_size:
+				raise ValueError("artifact is missing selected road/sidewalk mask, camera matrix, or capture size")
+			loaded = trimesh.load(ASSET_PATH, file_type="gltf", force="scene")
+			if not isinstance(loaded, trimesh.Scene):
+				loaded = trimesh.Scene(loaded)
+			meshes = loaded.dump(concatenate=False)
+			stats = remove_vertices_inside_masks(
+				meshes, mask_names, camera_pose["matrix"], capture_size
+			)
+			if stats["vertices_removed"] == 0:
+				raise ValueError("road mask contains no projected mesh vertices")
+			output_name = f"road_mask_vertices_removed_{index}.glb"
+			trimesh.Scene(meshes).export(CAPTURES_PATH / output_name, file_type="glb")
+			retiled_meshes, added_triangles = retile_mesh_holes(meshes)
+			retiled_output_name = f"road_mask_vertices_retiled_{index}.glb"
+			trimesh.Scene(retiled_meshes).export(CAPTURES_PATH / retiled_output_name, file_type="glb")
+			stats["triangles_added"] = added_triangles
+			LOGGER.info(
+				"Road mask retiling: artifact=%d new_flat_triangles=%d output=%s",
+				index, added_triangles, retiled_output_name,
+			)
+			LOGGER.info(
+				"Road mask vertex removal test: artifact=%d vertices_removed=%d triangles_removed=%d triangles_added=%d output=%s retiled_output=%s",
+				index, stats["vertices_removed"], stats["triangles_removed"], added_triangles, output_name, retiled_output_name,
+			)
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index]["road_mask_vertex_removal_asset"] = output_name
+				artifacts[index]["road_mask_vertex_retiling_asset"] = retiled_output_name
+				artifacts[index]["road_mask_vertex_removal_status"] = "completed"
+				artifacts[index]["road_mask_vertex_removal_stats"] = stats
+				artifacts[index]["road_mask_vertex_removal_masks"] = [path.name for path in mask_names]
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			self.set_caption(f"Road mask removal saved: {output_name}")
+		except Exception as exc:
+			try:
+				with ARTIFACTS_LOCK:
+					with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+						artifacts = json.load(artifacts_file)
+					artifacts[index]["road_mask_vertex_removal_status"] = "failed"
+					with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+						json.dump(artifacts, artifacts_file, indent=2)
+			except Exception:
+				LOGGER.exception("Failed to persist road mask removal failure status")
+			self.set_caption(f"Road mask removal failed: {exc}")
+			LOGGER.exception("Road mask vertex removal failed for artifact %d", index)
+
+	def _run_road_smoothing_worker(self, index: int) -> None:
+		try:
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			artifact = artifacts[index]
+			road_names = [
+				str(name) for name in artifact.get("mask2former_masks", [])
+				if "mask2former_road" in str(name).lower()
+			]
+			if not road_names:
+				raise ValueError("artifact has no Mask2Former road segmentation image")
+			camera_pose = artifact.get("camera_pose", {})
+			capture_size = camera_pose.get("capture_size", {})
+			if "matrix" not in camera_pose or not capture_size:
+				raise ValueError("artifact is missing camera matrix or capture size")
+			loaded = trimesh.load(ASSET_PATH, file_type="gltf", force="scene")
+			if not isinstance(loaded, trimesh.Scene):
+				loaded = trimesh.Scene(loaded)
+			meshes = loaded.dump(concatenate=False)
+			original_vertices = [np.asarray(mesh.vertices, dtype=np.float64).copy() for mesh in meshes]
+			original_triangle_count = sum(len(mesh.faces) for mesh in meshes)
+			face_records = project_scene_faces(loaded, camera_pose, capture_size)
+			road_masks = [
+				sample_mask(CAPTURES_PATH / name, face_records, capture_size)
+				for name in road_names
+				if (CAPTURES_PATH / name).is_file()
+			]
+			if not road_masks:
+				raise ValueError("Mask2Former road segmentation image does not exist")
+			masked_vertices_by_mesh: dict[int, set[int]] = {}
+			for road_mask in road_masks:
+				for mesh_index, face_index in road_mask.get("selected_faces", []):
+					if not (0 <= int(mesh_index) < len(meshes)):
+						continue
+					face = np.asarray(meshes[int(mesh_index)].faces[int(face_index)], dtype=np.int64)
+					masked_vertices_by_mesh.setdefault(int(mesh_index), set()).update(int(vertex) for vertex in face)
+			masked_vertex_count = sum(len(vertices) for vertices in masked_vertices_by_mesh.values())
+			LOGGER.info(
+				"Road mask vertex coverage: artifact=%d selected_faces=%d masked_vertices=%d meshes=%d",
+				index,
+				sum(int(mask.get("selected_count", 0)) for mask in road_masks),
+				masked_vertex_count,
+				len(masked_vertices_by_mesh),
+			)
+			changes = smooth_masked_road(meshes, road_masks)
+			if not changes:
+				raise ValueError("Mask2Former road mask selected no smoothable road vertices")
+			modified_triangle_count = 0
+			for mesh, original in zip(meshes, original_vertices):
+				moved_vertices = np.linalg.norm(
+					np.asarray(mesh.vertices, dtype=np.float64) - original, axis=1
+				) > 1e-8
+				if np.any(moved_vertices):
+					modified_triangle_count += int(np.any(moved_vertices[np.asarray(mesh.faces)], axis=1).sum())
+			processed_triangle_count = sum(len(mesh.faces) for mesh in meshes)
+			removed_triangle_count = max(0, original_triangle_count - processed_triangle_count)
+			triangle_stats = {
+				"triangles_before": original_triangle_count,
+				"triangles_after": processed_triangle_count,
+				"triangles_removed": removed_triangle_count,
+				"triangles_modified": modified_triangle_count,
+			}
+			vertex_stats = {
+				"masked_vertices": masked_vertex_count,
+				"meshes_with_masked_vertices": len(masked_vertices_by_mesh),
+				"moved_vertices": sum(int(change.get("moved_vertex_count", 0)) for change in changes),
+				"smoothable_vertices": sum(int(change.get("interior_vertex_count", 0)) for change in changes),
+			}
+			LOGGER.info(
+				"Road smoothing vertex stats: artifact=%d masked=%d smoothable=%d moved=%d",
+				index,
+				vertex_stats["masked_vertices"],
+				vertex_stats["smoothable_vertices"],
+				vertex_stats["moved_vertices"],
+			)
+			LOGGER.info(
+				"Road smoothing triangle stats: artifact=%d before=%d after=%d removed=%d modified=%d",
+				index,
+				original_triangle_count,
+				processed_triangle_count,
+				removed_triangle_count,
+				modified_triangle_count,
+			)
+			output_name = f"road_smoothed_{index}.glb"
+			output_path = CAPTURES_PATH / output_name
+			trimesh.Scene(meshes).export(output_path, file_type="glb")
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index]["road_smoothing_asset"] = output_name
+				artifacts[index]["road_smoothing_status"] = "smoothed"
+				artifacts[index]["road_smoothing_changes"] = changes
+				artifacts[index]["road_smoothing_triangle_stats"] = triangle_stats
+				artifacts[index]["road_smoothing_vertex_stats"] = vertex_stats
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			self.set_caption(f"Road smoothing saved: {output_name}")
+		except Exception as exc:
+			self.set_caption(f"Road smoothing failed: {exc}")
+			LOGGER.exception("Road smoothing failed for artifact %d", index)
+
+	def run_building_regularization(self, index: int, aggression: float = 0.5) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		threading.Thread(
+			target=self._run_building_regularization_worker,
+			args=(index, max(0.0, min(1.0, aggression))),
+			name=f"building-regularization-{index}",
+			daemon=True,
+		).start()
+		self.set_caption(f"Building regularization started for artifact {index + 1} (aggression {aggression:.2f})")
+
+	def _request_mlsd_lines(self, image_path: Path, index: int) -> tuple[str, dict[str, object]]:
+		with CONFIG_PATH.open(encoding="utf-8") as config_file:
+			config = json.load(config_file)
+		settings = config.get("mlsd_generator", {})
+		if not isinstance(settings, dict):
+			raise ValueError("config.json is missing mlsd_generator")
+		rabbitmq_url = self._rabbitmq_url(config, "mlsd_generator", settings)
+		queue_name = str(settings.get("queue", "mlsd"))
+		request = {
+			"image_base64": base64.b64encode(image_path.read_bytes()).decode("ascii"),
+			"score_threshold": float(settings.get("score_threshold", 0.2)),
+		}
+		import pika
+		correlation_id = str(uuid.uuid4())
+		parameters = pika.URLParameters(rabbitmq_url)
+		parameters.heartbeat = 0
+		connection = pika.BlockingConnection(parameters)
+		channel = connection.channel()
+		channel.queue_declare(queue=queue_name, durable=True)
+		reply_queue = channel.queue_declare(queue="", exclusive=True).method.queue
+		response: bytes | None = None
+
+		def on_response(_channel, _method, properties, body: bytes) -> None:
+			nonlocal response
+			if properties.correlation_id == correlation_id:
+				response = body
+
+		consumer_tag = channel.basic_consume(queue=reply_queue, on_message_callback=on_response, auto_ack=True)
+		channel.basic_publish(
+			exchange="", routing_key=queue_name, body=json.dumps(request).encode("utf-8"),
+			properties=pika.BasicProperties(content_type="application/json", correlation_id=correlation_id, reply_to=reply_queue),
+		)
+		try:
+			deadline = time.monotonic() + float(settings.get("timeout", 300))
+			while response is None:
+				remaining = deadline - time.monotonic()
+				if remaining <= 0:
+					raise TimeoutError("M-LSD worker response timed out")
+				connection.process_data_events(time_limit=min(1.0, remaining))
+		finally:
+			channel.basic_cancel(consumer_tag)
+			connection.close()
+		result = json.loads(response.decode("utf-8"))
+		if not result.get("ok"):
+			raise RuntimeError(result.get("error", "M-LSD worker failed"))
+		line_name = f"building_mlsd_lines_{index}.png"
+		(CAPTURES_PATH / line_name).write_bytes(base64.b64decode(result["line_map_base64"]))
+		LOGGER.info("M-LSD line map saved: artifact=%d file=%s metadata=%s", index, line_name, result.get("metadata", {}))
+		return line_name, dict(result.get("metadata", {}))
+
+	def run_mlsd_for_artifact(self, index: int) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		image_name = artifacts[index].get("result_render") or artifacts[index].get("texture_render")
+		if not image_name:
+			raise ValueError("artifact has no generated or texture image for M-LSD")
+		image_path = CAPTURES_PATH / str(image_name)
+		if not image_path.is_file():
+			raise ValueError(f"M-LSD source image does not exist: {image_name}")
+		threading.Thread(
+			target=self._run_mlsd_artifact_worker,
+			args=(index, image_path),
+			name=f"mlsd-artifact-{index}",
+			daemon=True,
+		).start()
+		self.set_caption(f"M-LSD started for artifact {index + 1}")
+
+	def _run_mlsd_artifact_worker(self, index: int, image_path: Path) -> None:
+		try:
+			line_name, line_metadata = self._request_mlsd_lines(image_path, index)
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index]["building_regularization_lines"] = line_name
+				artifacts[index]["building_regularization_line_metadata"] = line_metadata
+				artifacts[index]["building_regularization_lines_source"] = image_path.name
+				artifacts[index]["building_regularization_lines_status"] = "generated"
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			self.set_caption(f"M-LSD lines saved: {line_name}")
+			LOGGER.info("M-LSD artifact update complete: artifact=%d line_file=%s", index, line_name)
+		except Exception as exc:
+			self.set_caption(f"M-LSD failed: {exc}")
+			LOGGER.exception("M-LSD failed for artifact %d", index)
+
+	def _run_building_regularization_worker(self, index: int, aggression: float) -> None:
+		try:
+			LOGGER.info("Building regularization started: artifact=%d aggression=%.2f", index, aggression)
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			artifact = artifacts[index]
+			building_names = [
+				str(name) for name in artifact.get("mask2former_masks", [])
+				if "mask2former_building" in str(name).lower()
+			]
+			if not building_names:
+				raise ValueError("artifact has no Mask2Former building segmentation image")
+			LOGGER.info("Building regularization masks: artifact=%d files=%s", index, building_names)
+			image_name = artifact.get("result_render")
+			if not image_name:
+				raise ValueError("artifact has no generated result image for M-LSD lines")
+			image_path = CAPTURES_PATH / str(image_name)
+			if not image_path.is_file():
+				raise ValueError(f"generated result image does not exist: {image_name}")
+			camera_pose = artifact.get("camera_pose", {})
+			capture_size = camera_pose.get("capture_size", {})
+			if "matrix" not in camera_pose or not capture_size:
+				raise ValueError("artifact is missing camera matrix or capture size")
+			loaded = trimesh.load(ASSET_PATH, file_type="gltf", force="scene")
+			if not isinstance(loaded, trimesh.Scene):
+				loaded = trimesh.Scene(loaded)
+			meshes = loaded.dump(concatenate=False)
+			face_records = project_scene_faces(loaded, camera_pose, capture_size)
+			visible_keys = visible_face_keys(face_records, capture_size)
+			LOGGER.info("Building regularization projection: artifact=%d meshes=%d projected_faces=%d visible_faces=%d", index, len(meshes), len(face_records), len(visible_keys))
+			building_masks = [
+				sample_mask(CAPTURES_PATH / name, face_records, capture_size)
+				for name in building_names
+				if (CAPTURES_PATH / name).is_file()
+			]
+			if not building_masks:
+				raise ValueError("Mask2Former building segmentation image does not exist")
+			building_faces = {
+				(int(face[0]), int(face[1]))
+				for mask in building_masks
+				for face in mask.get("selected_faces", [])
+				if tuple(face) in visible_keys
+			}
+			LOGGER.info("Building regularization selection: artifact=%d mask_faces=%d visible_building_faces=%d", index, sum(mask.get("selected_count", 0) for mask in building_masks), len(building_faces))
+			line_name, line_metadata = self._request_mlsd_lines(image_path, index)
+			with Image.open(CAPTURES_PATH / line_name) as line_image:
+				line_map = np.asarray(line_image.convert("L"))
+			LOGGER.info("Building regularization M-LSD: artifact=%d image=%s line_file=%s line_pixels=%d", index, image_path.name, line_name, line_metadata.get("line_pixels", 0))
+			changes = regularize_masked_buildings(meshes, building_faces, face_records, line_map, aggression=aggression)
+			if not changes:
+				raise ValueError("Mask2Former building mask selected no regularizable in-view polygons")
+			output_name = f"buildings_regularized_{index}.gltf"
+			trimesh.Scene(meshes).export(CAPTURES_PATH / output_name, file_type="gltf")
+			LOGGER.info("Building regularization geometry: artifact=%d aggression=%.2f components=%d changes=%s output=%s", index, aggression, len(changes), changes, output_name)
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index]["building_regularization_asset"] = output_name
+				artifacts[index]["building_regularization_lines"] = line_name
+				artifacts[index]["building_regularization_line_metadata"] = line_metadata
+				artifacts[index]["building_regularization_aggression"] = aggression
+				artifacts[index]["building_regularization_status"] = "regularized"
+				artifacts[index]["building_regularization_changes"] = changes
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			self.set_caption(f"Building regularization saved: {output_name}")
+			LOGGER.info("Building regularization complete: artifact=%d status=regularized line_file=%s mesh_file=%s", index, line_name, output_name)
+		except Exception as exc:
+			self.set_caption(f"Building regularization failed: {exc}")
+			LOGGER.exception("Building regularization failed for artifact %d", index)
+
+	def run_depth_anything_for_artifact(self, index: int) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		artifact = artifacts[index]
+		image_name = artifact.get("result_render")
+		if not image_name:
+			raise ValueError("artifact has no generated result image")
+		image_path = CAPTURES_PATH / str(image_name)
+		if not image_path.is_file():
+			raise ValueError(f"generated result image does not exist: {image_name}")
+		LOGGER.info("Depth Anything rerun requested: artifact=%d source=%s bytes=%d", index, image_path.name, image_path.stat().st_size)
+		threading.Thread(
+			target=self._run_depth_anything_artifact_worker,
+			args=(index, image_path),
+			name=f"depth-anything-artifact-{index}", daemon=True,
+		).start()
+		self.set_caption(f"Depth Anything started for artifact {index + 1}")
+
+	def _run_depth_anything_artifact_worker(self, index: int, image_path: Path) -> None:
+		try:
+			started = time.monotonic()
+			self.set_caption(f"Depth Anything running for artifact {index + 1}")
+			depth_path = self._request_configured_depth(image_path)
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index]["generated_depth_render"] = depth_path.name
+				artifacts[index]["depth_anything_source"] = image_path.name
+				artifacts[index]["depth_anything_rerun_at"] = datetime.now().astimezone().isoformat()
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			LOGGER.info("Depth Anything artifact update complete: artifact=%d source=%s output=%s duration=%.2fs", index, image_path.name, depth_path.name, time.monotonic() - started)
+			self.set_caption(f"Depth Anything saved for artifact {index + 1}: {depth_path.name}")
+		except Exception as exc:
+			LOGGER.exception("Depth Anything artifact rerun failed: artifact=%d source=%s", index, image_path)
+			self.set_caption(f"Depth Anything failed for artifact {index + 1}: {exc}")
+
+	def _run_mesh_refinement_worker(self, index: int) -> None:
+		try:
+			started = time.monotonic()
+			LOGGER.info("Mesh refinement started: artifact=%d", index)
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			artifact = artifacts[index]
+			loaded = trimesh.load(ASSET_PATH, file_type="gltf", force="scene")
+			if not isinstance(loaded, trimesh.Scene):
+				loaded = trimesh.Scene(loaded)
+			camera_pose = artifact.get("camera_pose", {})
+			capture_size = camera_pose.get("capture_size", {})
+			if "matrix" not in camera_pose or not capture_size:
+				raise ValueError("artifact is missing camera matrix or capture size")
+			meshes = loaded.dump(concatenate=False)
+			LOGGER.info("Mesh refinement loaded source: artifact=%d meshes=%d", index, len(meshes))
+			mesh_inventory = []
+			total_vertices = 0
+			total_faces = 0
+			for mesh_index, mesh in enumerate(meshes):
+				vertices = int(len(mesh.vertices))
+				faces = int(len(mesh.faces))
+				total_vertices += vertices
+				total_faces += faces
+				mesh_inventory.append({
+					"mesh_index": mesh_index,
+					"vertices": vertices,
+					"faces": faces,
+					"has_uv": bool(mesh.visual.uv is not None),
+					"bounds": np.asarray(mesh.bounds, dtype=float).tolist(),
+				})
+			sidecar_name = f"refinement_{index}.json"
+			sidecar_path = CAPTURES_PATH / sidecar_name
+			refined_name = f"refined_{index}.glb"
+			refined_path = CAPTURES_PATH / refined_name
+			source_hash = hashlib.sha256(ASSET_PATH.read_bytes()).hexdigest()
+			face_records = project_scene_faces(loaded, camera_pose, capture_size)
+			LOGGER.info("Mesh refinement projected faces: artifact=%d faces=%d", index, len(face_records))
+			depth_guidance = {"available": False, "relative_only": True}
+			depth_name = artifact.get("generated_depth_render")
+			if depth_name:
+				depth_path = CAPTURES_PATH / str(depth_name)
+				if depth_path.is_file():
+					depth_map, depth_metadata = load_relative_depth(depth_path, capture_size)
+					depth_guidance = {
+						"available": True,
+						**depth_metadata,
+						**sample_relative_depth(depth_map, face_records),
+					}
+					LOGGER.info("Mesh refinement loaded depth guidance: artifact=%d file=%s faces=%d", index, depth_name, depth_guidance.get("face_count", 0))
+				else:
+					LOGGER.warning("Mesh refinement depth file missing: artifact=%d file=%s", index, depth_path)
+			visible_faces = [
+				record for record in face_records
+				if record["in_front"] and record["in_frame"]
+			]
+			semantic_masks = []
+			for mask_name in artifact.get("segmentation_masks", []) + artifact.get("mask2former_masks", []):
+				mask_path = CAPTURES_PATH / str(mask_name)
+				if mask_path.is_file():
+					semantic_masks.append(sample_mask(mask_path, face_records, capture_size))
+					LOGGER.info("Mesh refinement sampled mask: artifact=%d file=%s selected=%d", index, mask_name, semantic_masks[-1]["selected_count"])
+				else:
+					LOGGER.warning("Mesh refinement mask file missing: artifact=%d file=%s", index, mask_path)
+			visible_face_keys_set = visible_face_keys(face_records, capture_size)
+			geometry_changes = []
+			if depth_guidance.get("available"):
+				geometry_changes = apply_conservative_geometry_refinement(
+					meshes,
+					face_records,
+					semantic_masks,
+					depth_guidance,
+					visible_face_keys_set,
+				)
+			LOGGER.info("Mesh refinement geometry pass complete: artifact=%d changes=%d visible_faces=%d", index, len(geometry_changes), len(visible_face_keys_set))
+			refined_scene = trimesh.Scene(meshes)
+			refined_scene.export(refined_path, file_type="glb")
+			sidecar = {
+				"version": 1,
+				"status": "refined" if geometry_changes else "depth_analyzed",
+				"source_asset": ASSET_PATH.name,
+				"source_asset_sha256": source_hash,
+				"refined_asset": refined_name,
+				"artifact_index": index,
+				"camera_pose": artifact.get("camera_pose", {}),
+				"source_images": {
+					"result_render": artifact.get("result_render"),
+					"depth_render": artifact.get("depth_render"),
+					"generated_depth_render": artifact.get("generated_depth_render"),
+				},
+				"annotations": {
+					"segmentation_masks": artifact.get("segmentation_masks", []),
+					"mask2former_masks": artifact.get("mask2former_masks", []),
+					"grounding_dino_detections": artifact.get("grounding_dino_detections", {}),
+				},
+				"mesh": {
+					"mesh_count": len(meshes),
+					"total_vertices": total_vertices,
+					"total_faces": total_faces,
+					"items": mesh_inventory,
+				},
+				"projection": {
+					"yfov_degrees": 45.0,
+					"face_count": len(face_records),
+					"visible_face_count": len(visible_faces),
+					"faces": face_records,
+					"semantic_masks": semantic_masks,
+				},
+				"depth_guidance": depth_guidance,
+				"geometry_changes": geometry_changes,
+			}
+			sidecar_path.write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index]["refinement_sidecar"] = sidecar_name
+				artifacts[index]["refined_asset"] = refined_name
+				artifacts[index]["refinement_status"] = "refined" if geometry_changes else "depth_analyzed"
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			LOGGER.info("Mesh refinement complete: artifact=%d status=%s duration=%.2fs output=%s", index, "refined" if geometry_changes else "depth_analyzed", time.monotonic() - started, refined_path)
+			self.set_caption(f"Mesh refinement saved: {total_faces} faces, {total_vertices} vertices")
+			LOGGER.info(
+				"Mesh refinement inventory saved: artifact=%d meshes=%d faces=%d vertices=%d sidecar=%s",
+				index, len(meshes), total_faces, total_vertices, sidecar_path,
+			)
+		except Exception as exc:
+			self.set_caption(f"Mesh refinement failed: {exc}")
+			LOGGER.exception("Mesh refinement failed for artifact %d", index)
 
 	def run_segmentation_for_artifact(self, index: int) -> None:
 		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
@@ -752,7 +1474,150 @@ class ModelWindow(pyglet.window.Window):
 		else:
 			self.color_buffer, _ = self.renderer.render(self.render_scene, flags=flags)
 			self.color_buffer = self.color_buffer.copy()
+		if self.show_edges:
+			self.draw_triangle_edges()
 		self.invalid = True
+
+	def toggle_visible_face_colors(self) -> None:
+		LOGGER.info(
+			"In-view color toggle: enabled=%s mode=%s texture=%s meshes=%d",
+			self.show_visible_faces, self.mode, self.use_texture, len(self.render_scene._walk_meshes),
+		)
+		if self.show_visible_faces:
+			if self._visible_face_base_meshes is not None:
+				self.show_visible_faces = False
+				self._rebuild_render_scene([mesh.copy() for mesh in self._visible_face_base_meshes])
+				self.set_texture_mode(False)
+			LOGGER.info("In-view color toggle disabled: restored flat base colors")
+			self.set_caption("in-view triangle colors off")
+			return
+		self.set_texture_mode(False)
+		camera_pose = self.render_scene.get_pose(self.render_scene._orbit_camera_node)
+		height, width = self.color_buffer.shape[:2]
+		base_meshes = [mesh.copy() for mesh in self.render_scene._walk_meshes]
+		projection_scene = trimesh.Scene(base_meshes)
+		face_records = project_scene_faces(
+			projection_scene,
+			{"matrix": camera_pose, "capture_size": {"width": width, "height": height}},
+			{"width": width, "height": height},
+		)
+		visible_keys = visible_face_keys(face_records, {"width": width, "height": height})
+		LOGGER.info(
+			"In-view visibility result: projected_faces=%d visible_faces=%d camera=%s viewport=%dx%d",
+			len(face_records), len(visible_keys), np.round(camera_pose, 3).tolist(), width, height,
+		)
+		self._visible_face_base_meshes = [mesh.copy() for mesh in base_meshes]
+		red_counts = []
+		for mesh_index, mesh in enumerate(base_meshes):
+			face_colors = np.tile(np.array([150, 165, 180, 255], dtype=np.uint8), (len(mesh.faces), 1))
+			for face_index in range(len(mesh.faces)):
+				if (mesh_index, face_index) in visible_keys:
+					face_colors[face_index] = [235, 35, 35, 255]
+			mesh.visual.face_colors = face_colors
+			red_counts.append(int(np.sum(np.all(face_colors[:, :3] == [235, 35, 35], axis=1))))
+		LOGGER.info("In-view red face counts by mesh: total=%d nonzero_meshes=%d", sum(red_counts), sum(count > 0 for count in red_counts))
+		self.show_visible_faces = True
+		self._rebuild_render_scene(base_meshes)
+		self.set_texture_mode(False)
+		primitive_count = 0
+		color_buffer_count = 0
+		for node in self.render_scene.mesh_nodes:
+			for primitive in node.mesh.primitives:
+				primitive_count += 1
+				if getattr(primitive, "color_0", None) is not None:
+					color_buffer_count += 1
+		LOGGER.info(
+			"In-view render rebuild: primitives=%d primitives_with_vertex_colors=%d texture_mode=%s",
+			primitive_count, color_buffer_count, self.use_texture,
+		)
+		self.set_caption(f"in-view triangle colors on ({len(visible_keys)})")
+
+	def _rebuild_render_scene(self, meshes: list[trimesh.Trimesh]) -> None:
+		old_pose = self.render_scene.get_pose(self.render_scene._orbit_camera_node)
+		new_scene = pyrender.Scene(bg_color=self.render_scene.bg_color, ambient_light=[1.0, 1.0, 1.0])
+		render_meshes = meshes
+		if self.show_visible_faces:
+			render_meshes = []
+			for mesh in meshes:
+				face_colors = np.asarray(mesh.visual.face_colors, dtype=np.uint8)
+				vertices = np.asarray(mesh.vertices)[np.asarray(mesh.faces)].reshape(-1, 3)
+				faces = np.arange(len(vertices), dtype=np.int64).reshape(-1, 3)
+				render_meshes.append(trimesh.Trimesh(
+					vertices=vertices,
+					faces=faces,
+					vertex_colors=np.repeat(face_colors, 3, axis=0),
+					process=False,
+				))
+			LOGGER.info("Prepared explicit vertex colors for %d meshes", len(render_meshes))
+		new_scene.add(pyrender.Mesh.from_trimesh(render_meshes, smooth=False))
+		new_scene._walk_meshes = meshes
+		new_scene._orbit_center = self.render_scene._orbit_center.copy()
+		new_scene._orbit_extent = self.render_scene._orbit_extent
+		camera_node = new_scene.add(self.camera, name="orbit_camera")
+		new_scene._orbit_camera_node = camera_node
+		new_scene.set_pose(camera_node, old_pose)
+		self.render_scene = new_scene
+		self._material_state = {}
+		self._edge_cache_key = None
+		self._edge_overlay = None
+
+	def set_texture_mode(self, use_texture: bool) -> None:
+		self.use_texture = use_texture
+		for primitive_index, primitive in enumerate(
+			primitive
+			for node in self.render_scene.mesh_nodes
+			for primitive in node.mesh.primitives
+		):
+			material = primitive.material
+			if material is None:
+				continue
+			key = id(primitive)
+			if key not in self._material_state:
+				self._material_state[key] = (
+					getattr(material, "baseColorTexture", None),
+					getattr(material, "baseColorFactor", [1.0, 1.0, 1.0, 1.0]),
+				)
+			texture, factor = self._material_state[key]
+			if use_texture:
+				material.baseColorTexture = texture
+				material.baseColorFactor = factor
+			elif self.show_visible_faces:
+				material.baseColorTexture = None
+				material.baseColorFactor = [1.0, 1.0, 1.0, 1.0]
+			else:
+				color = np.array([
+					0.30 + 0.55 * ((primitive_index * 0.37) % 1.0),
+					0.42 + 0.38 * ((primitive_index * 0.61) % 1.0),
+					0.48 + 0.34 * ((primitive_index * 0.83) % 1.0),
+					1.0,
+				], dtype=np.float32)
+				material.baseColorTexture = None
+				material.baseColorFactor = color
+		self._edge_cache_key = None
+		self._edge_overlay = None
+		self.set_caption(f"merged.gltf | {'textured' if use_texture else 'flat colors'}")
+
+	def draw_triangle_edges(self) -> None:
+		"""Overlay pyrender's native wireframe pass in white."""
+		camera_pose = self.render_scene.get_pose(self.render_scene._orbit_camera_node)
+		cache_key = (
+			self.width,
+			self.height,
+			id(self.render_scene._walk_meshes),
+			tuple(np.round(camera_pose.ravel(), 6)),
+		)
+		if cache_key != self._edge_cache_key:
+			wire_color, _wire_depth = self.renderer.render(
+				self.render_scene,
+				flags=pyrender.RenderFlags.RGBA | pyrender.RenderFlags.ALL_WIREFRAME,
+			)
+			background = np.asarray(self.render_scene.bg_color[:3], dtype=np.float32) * 255.0
+			self._edge_overlay = np.max(
+				np.abs(wire_color[:, :, :3].astype(np.float32) - background), axis=2
+			) > 3.0
+			self._edge_cache_key = cache_key
+		if self._edge_overlay is not None:
+			self.color_buffer[self._edge_overlay, :3] = 255
 
 	def on_draw(self) -> None:
 		self.clear()
@@ -787,6 +1652,10 @@ class ModelWindow(pyglet.window.Window):
 		if symbol == pyglet.window.key.F:
 			self.set_fullscreen(not self.fullscreen)
 			self.set_exclusive_mouse(self.fullscreen and self.walk_mode)
+			return
+		if symbol == pyglet.window.key.E:
+			self.show_edges = not self.show_edges
+			self.set_caption(f"merged.gltf | edges {'on' if self.show_edges else 'off'}")
 			return
 		if symbol == pyglet.window.key.G and self.walk_mode:
 			self.walk_mode = False
@@ -1106,10 +1975,11 @@ class ModelWindow(pyglet.window.Window):
 		}
 		correlation_id = str(uuid.uuid4())
 		LOGGER.info(
-			"Sending generated texture to depth worker: model=%s queue=%s image=%s",
+			"Sending image to Depth Anything worker: model=%s queue=%s image=%s bytes=%d",
 			model,
 			queue,
 			image_path.name,
+			image_path.stat().st_size,
 		)
 		import pika
 		parameters = pika.URLParameters(rabbitmq_url)
@@ -1140,6 +2010,7 @@ class ModelWindow(pyglet.window.Window):
 		)
 		try:
 			deadline = time.monotonic() + float(depth_config.get("timeout", 300))
+			LOGGER.info("Depth Anything worker awaiting response: correlation_id=%s timeout=%ss", correlation_id, depth_config.get("timeout", 300))
 			while response is None:
 				remaining = deadline - time.monotonic()
 				if remaining <= 0:
@@ -1150,6 +2021,7 @@ class ModelWindow(pyglet.window.Window):
 			connection.close()
 
 		result = json.loads(response.decode("utf-8"))
+		LOGGER.info("Depth Anything worker response: ok=%s width=%s height=%s", result.get("ok"), result.get("width"), result.get("height"))
 		if not result.get("ok"):
 			raise RuntimeError(result.get("error", "Depth Anything worker failed"))
 		depth_base64 = result.get("depth_image_base64")

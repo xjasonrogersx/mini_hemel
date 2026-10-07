@@ -25,6 +25,15 @@
         "queue": "mask2former",
         "classes": ["building", "wall", "house", "roof", "window", "door", "tree", "street", "sidewalk"]
     },
+    "mlsd_generator": {
+        "flow": "rabbitmq",
+        "model": "models/mlsd_large_512_fp32.pth",
+        "source_dir": "/workspace/mlsd_pytorch",
+        "queue": "mlsd",
+        "input_size": 512,
+        "score_threshold": 0.2,
+        "timeout": 300
+    },
     "grounding_dino_generator": {
         "flow": "rabbitmq",
         "model": "IDEA-Research/grounding-dino-tiny",
