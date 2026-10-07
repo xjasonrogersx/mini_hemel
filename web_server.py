@@ -234,7 +234,6 @@ class ViewerWebServer:
             f'<p class="muted">Deploys the refined mesh with the generated result image projected onto it. This is separate from the road-refilled mesh.</p>'
             f'<p>{refined_view_button or "No reprojected texture available yet."}</p></section>'
         )
-        road_result = artifact.get("road_smoothing_asset")
         road_removal_result = artifact.get("road_mask_vertex_removal_asset")
         road_retiling_result = artifact.get("road_mask_vertex_retiling_asset")
         road_removal_status = str(artifact.get("road_mask_vertex_removal_status") or "not started")
@@ -268,35 +267,8 @@ class ViewerWebServer:
             '<p class="muted">Test not run yet. This removes vertices projected inside the road mask and the triangles attached to them.</p>'
             f'<p>{road_removal_controls}<button onclick="removeRoadMaskVertices()">Run mask vertex removal test</button></p>'
         )
-        road_triangle_stats = artifact.get("road_smoothing_triangle_stats", {})
-        road_triangle_summary = (
-            f'<p class="muted">Triangles: {int(road_triangle_stats.get("triangles_before", 0))} before, '
-            f'{int(road_triangle_stats.get("triangles_after", 0))} after; '
-            f'{int(road_triangle_stats.get("triangles_modified", 0))} modified, '
-            f'{int(road_triangle_stats.get("triangles_removed", 0))} removed.</p>'
-            if isinstance(road_triangle_stats, dict) and road_triangle_stats else
-            '<p class="muted">Triangle statistics are not available for this mesh yet.</p>'
-        )
-        road_vertex_stats = artifact.get("road_smoothing_vertex_stats", {})
-        road_vertex_summary = (
-            f'<p class="muted">Masked vertices: {int(road_vertex_stats.get("masked_vertices", 0))}; '
-            f'smoothable: {int(road_vertex_stats.get("smoothable_vertices", 0))}; '
-            f'moved: {int(road_vertex_stats.get("moved_vertices", 0))}.</p>'
-            if isinstance(road_vertex_stats, dict) and road_vertex_stats else
-            '<p class="muted">Masked vertex statistics are not available for this mesh yet.</p>'
-        )
         building_result = artifact.get("building_regularization_asset")
-        road_asset_path = self.captures_path / str(road_result) if road_result else None
-        road_texture_button = (
-            '<button onclick="viewRoadSmoothed()">Texture reprojection to viewer</button>'
-            if road_asset_path and road_asset_path.is_file() and road_asset_path.suffix.lower() == ".glb" else
-            '<button disabled title="Run road smoothing first">Texture reprojection to viewer (run road smoothing first)</button>'
-        )
-        road_section = (
-            f'<section class="operation"><h2>Road-smoothed mesh</h2><p class="muted">Smooths road geometry using the detected road mask. Choose mesh-only deployment or project the generated texture onto this road-smoothed mesh.</p><p class="muted">Status: {html.escape(str(artifact.get("road_smoothing_status")))}</p>{road_vertex_summary}{road_triangle_summary}<button onclick="smoothRoad()">Run road smoothing</button> <button onclick="loadRoadSmoothed()">Deploy mesh to viewer</button> {road_texture_button}{road_removal_section}</section>'
-            if road_result else
-            f'<section class="operation"><h2>Road-smoothed mesh</h2><p class="muted">Smooths road geometry using the detected road mask. Choose mesh-only deployment or project the generated texture onto this road-smoothed mesh.</p><p class="muted">No road-smoothed mesh yet.</p><button onclick="smoothRoad()">Run road smoothing</button> {road_texture_button}{road_removal_section}</section>'
-        )
+        road_section = f'<section class="operation"><h2>Road mask removal and retiling</h2>{road_removal_section}</section>'
         building_section = (
             f'<section class="operation"><h2>Building-regularized mesh</h2><p class="muted">Uses Open3D to smooth and simplify building surfaces from building masks and M-LSD structural lines. Deployment loads the generated mesh only.</p><p class="muted">Status: {html.escape(str(artifact.get("building_regularization_status")))}</p><p class="muted">M-LSD lines: {html.escape(str(artifact.get("building_regularization_lines_status", "not generated")))}</p><label for="buildingAggression">Aggression</label> <input id="buildingAggression" class="range" type="range" min="0" max="1" step="0.05" value="0.5" oninput="document.getElementById(\'buildingAggressionValue\').textContent=Number(this.value).toFixed(2)"> <output id="buildingAggressionValue">0.50</output><p><button onclick="runMlsd()">Run / rerun M-LSD</button> <button onclick="regularizeBuildings()">Run Open3D building regularization</button> <button onclick="loadBuildingsRegularized()">Deploy mesh to viewer</button></p></section>'
             if building_result else
@@ -363,15 +335,12 @@ button,select,input {{ border:1px solid var(--line); background:var(--panel); bo
 <script>
 async function navigate() {{ const status=document.getElementById('status'); status.textContent='Navigating...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'navigate',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Display moved to this pose':data.error; }}
 async function viewRefined() {{ const status=document.getElementById('status'); status.textContent='Loading refined texture...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'view_refined',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Refined texture loaded in viewer':data.error; }}
-async function loadRoadSmoothed() {{ const status=document.getElementById('status'); status.textContent='Loading road-smoothed mesh...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'load_road_smoothed',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Road-smoothed mesh loaded':data.error; }}
-async function viewRoadSmoothed() {{ const status=document.getElementById('status'); status.textContent='Projecting generated texture onto road-smoothed mesh...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'view_road_smoothed',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Road-smoothed mesh with generated texture loaded':data.error; }}
 async function loadBuildingsRegularized() {{ const status=document.getElementById('status'); status.textContent='Loading building-regularized mesh...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'load_buildings_regularized',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Building-regularized mesh loaded':data.error; }}
 async function segment() {{ const status=document.getElementById('status'); status.textContent='Starting SegFormer...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'segment',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'SegFormer started; refresh this page when complete':data.error; }}
 async function mask2former() {{ const status=document.getElementById('status'); status.textContent='Starting Mask2Former...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'mask2former',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Mask2Former started; refresh this page when complete':data.error; }}
 async function runMlsd() {{ const status=document.getElementById('status'); status.textContent='Starting M-LSD...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'mlsd',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'M-LSD started; refresh this page when complete':data.error; }}
 async function depthAnything() {{ const status=document.getElementById('status'); status.textContent='Starting Depth Anything on generated result...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'depth_anything',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Depth Anything started on generated result; refresh this page when complete':data.error; }}
 async function refineMesh() {{ const status=document.getElementById('refinementStatus'); status.textContent='Refinement status: starting...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'refine_mesh',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Refinement status: started; refresh this page when complete':'Refinement status: '+data.error; }}
-async function smoothRoad() {{ const status=document.getElementById('status'); status.textContent='Starting road smoothing...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'smooth_road',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Road smoothing started; refresh this page when complete':data.error; }}
 async function waitForRoadMaskRemoval() {{ const status=document.getElementById('status'); for (;;) {{ await new Promise(resolve=>setTimeout(resolve,1500)); const response=await fetch('/api/artifacts',{{cache:'no-store'}}); const items=await response.json(); const artifact=items[{index}]; const state=artifact && artifact.road_mask_vertex_removal_status; if(state==='completed') {{ window.location.reload(); return; }} if(state==='failed') {{ status.textContent='Road-mask vertex removal failed'; return; }} status.textContent='Road-mask vertex removal running...'; }} }}
 async function removeRoadMaskVertices() {{ const status=document.getElementById('status'); const includeRoad=document.getElementById('removeRoadMask').checked; const includeSidewalk=document.getElementById('removeSidewalkMask').checked; if(!includeRoad && !includeSidewalk) {{ status.textContent='Select road or sidewalk first'; return; }} status.textContent='Starting road-mask vertex removal test...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'remove_road_mask_vertices',index:{index},include_road:includeRoad,include_sidewalk:includeSidewalk}})}}); const data=await response.json(); if(data.ok) {{ status.textContent='Road-mask vertex removal running...'; waitForRoadMaskRemoval(); }} else {{ status.textContent=data.error; }} }}
 async function loadRoadMaskVertexRemoval() {{ const status=document.getElementById('status'); status.textContent='Deploying test mesh...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'load_road_mask_vertex_removal',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Road-mask removal test mesh loaded':data.error; }}

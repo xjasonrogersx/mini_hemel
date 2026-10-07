@@ -22,9 +22,8 @@ source scene
     +--> conservative geometry refinement
 ```
 
-Road smoothing and building regularisation are separate modules:
+Building regularisation is a separate module:
 
-- `road_smoothing.py` owns Open3D road smoothing.
 - `building_regularization.py` owns Open3D building regularisation.
 
 ## Options
