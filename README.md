@@ -222,3 +222,755 @@ python3 model_server/mlsd_worker.py \
   --input-size 512 \
   --rabbitmq-url 'amqp://guest:guest@192.168.1.220:5672/%2F'
 ```
+# Semantic Reality Refinement
+## Materialising a World Through Observation
+
+### Origin
+
+The project starts with a low-detail mesh extracted from Google Earth.
+
+Traditionally, such a mesh would be treated as an approximation of a fixed ground truth world.
+
+This proposal takes a different view:
+
+> The LowLOD mesh is not the truth.
+>
+> It is a hint towards reality.
+
+The mesh provides:
+
+- Approximate geometry
+- Building locations
+- Road layouts
+- Terrain structure
+- Initial textures
+
+Everything else remains open to interpretation.
+
+---
+
+# Philosophical Inspiration
+
+## Schrödinger's Cat
+
+In the famous thought experiment, the cat exists in a superposition of states until observed.
+
+Applied to a semantic city model:
+
+```text
+LowLOD Building
+    =
+Many Possible Detailed Buildings
+```
+
+Observation gradually collapses these possibilities into a specific interpretation.
+
+---
+
+## Berkeley
+
+George Berkeley proposed:
+
+> "To be is to be perceived."
+
+In this system:
+
+- Unobserved regions remain loosely defined.
+- Observation increases detail.
+- Repeated observation increases certainty.
+
+The city becomes progressively more concrete as it is explored.
+
+---
+
+## Wheeler's Participatory Universe
+
+John Archibald Wheeler suggested that observers play a role in bringing reality into existence.
+
+In the semantic city:
+
+```text
+Observer
+    ->
+Observation
+    ->
+Inference
+    ->
+Materialisation
+```
+
+Reality emerges through participation.
+
+---
+
+# Core Principle
+
+Traditional Reconstruction:
+
+```text
+Reality
+    ->
+Images
+    ->
+Reconstruction
+```
+
+Semantic Reality Refinement:
+
+```text
+LowLOD World
+     ->
+Observation
+     ->
+Inference
+     ->
+World Update
+     ->
+Refined Reality
+```
+
+The goal is not:
+
+> What really exists?
+
+The goal is:
+
+> What is the most believable and self-consistent world?
+
+---
+
+# The LowLOD Mesh
+
+The LowLOD mesh acts as:
+
+```text
+Scaffold
+```
+
+rather than:
+
+```text
+Ground Truth
+```
+
+The mesh defines:
+
+- A building probably exists here
+- A road probably exists here
+- A tree probably exists here
+
+It does **not** define:
+
+- Exact doors
+- Exact windows
+- Architectural details
+- Shop displays
+- Interior structures
+
+These emerge over time.
+
+---
+
+# Semantic World Model
+
+Instead of a world being represented as:
+
+```text
+Mesh
+ └─ Triangles
+```
+
+Represent it as:
+
+```text
+World
+ ├─ Entities
+ ├─ Observations
+ ├─ Hypotheses
+ ├─ Canonical Facts
+ └─ Geometry
+```
+
+---
+
+# Entity Example
+
+```yaml
+entity:
+  id: building_001
+
+  class: building
+  subtype: sweet_shop
+
+  attributes:
+    style: victorian
+    occupancy: retail
+
+  geometry:
+    lod0_mesh: building.glb
+
+  observations: [...]
+  hypotheses: [...]
+```
+
+Geometry becomes a consequence of semantic understanding.
+
+---
+
+# Semantic Attributes
+
+Objects can carry semantic information:
+
+```yaml
+type: building
+subtype: sweet_shop
+
+style: victorian
+condition: maintained
+era: 1890s
+```
+
+These attributes constrain future generation.
+
+For example:
+
+```text
+Sweet Shop
+```
+
+supports:
+
+- Display windows
+- Signage
+- Shelving
+- Glass storefronts
+
+while discouraging:
+
+- Industrial equipment
+- Warehousing structures
+- Factory chimneys
+
+---
+
+# Observation Driven Reality
+
+Observers do not reveal detail.
+
+Observers create detail.
+
+Example:
+
+## At Long Range
+
+The system sees:
+
+```text
+Retail Unit
+```
+
+Only coarse representation is required.
+
+---
+
+## At Medium Range
+
+The system can infer:
+
+```text
+Sweet Shop
+```
+
+Additional semantic details become available.
+
+---
+
+## At Close Range
+
+The system may generate:
+
+```text
+Window displays
+Posters
+Shelves
+Product jars
+```
+
+Information density increases with observation distance.
+
+---
+
+# Example: Windows and Doors
+
+Initially:
+
+```text
+Flat textured façade
+```
+
+After observation:
+
+```text
+AI texture enhancement
+       +
+semantic segmentation
+```
+
+detects:
+
+```text
+door
+window
+window
+window
+```
+
+These detections become hypotheses.
+
+Eventually:
+
+```text
+Window
+```
+
+is promoted into:
+
+```text
+Actual geometry
+```
+
+creating:
+
+- Recesses
+- Frames
+- Window sills
+
+---
+
+# Unobserved Geometry
+
+Traditional systems:
+
+```text
+Back of building
+    =
+Unknown
+```
+
+Proposed system:
+
+```text
+Back of building
+    =
+Field of possibilities
+```
+
+Potential details can be generated from:
+
+- Architectural style
+- Nearby buildings
+- Semantic labels
+- Previous observations
+
+Observation resolves uncertainty.
+
+---
+
+# Reality States
+
+The world exists at multiple certainty levels.
+
+```text
+Observed
+Inference
+Potential
+```
+
+or alternatively:
+
+```text
+L0  Seed Reality
+L1  Semantic Reality
+L2  Generated Reality
+L3  Confirmed Reality
+L4  Canonical Reality
+```
+
+Example:
+
+```text
+Building exists                L0
+Sweet shop                     L1
+Display window                 L2
+Window frame geometry          L3
+Interior shelves               L4
+```
+
+---
+
+# Observation Objects
+
+Observations are immutable evidence.
+
+```yaml
+observation:
+  id: 123
+
+  source: observer_a
+
+  confidence: 0.87
+
+  detects:
+    - window
+    - door
+```
+
+Observations are never edited.
+
+They are historical records.
+
+---
+
+# Hypotheses
+
+Observations generate hypotheses.
+
+```yaml
+hypothesis:
+  type: chimney
+
+  confidence: 0.61
+
+  support:
+    observations: 4
+
+  state: candidate
+```
+
+Hypotheses are beliefs.
+
+Not facts.
+
+---
+
+# Hypothesis Promotion
+
+## State Machine
+
+```text
+Potential
+    ↓
+Candidate
+    ↓
+Probable
+    ↓
+Accepted
+    ↓
+Canonical
+```
+
+---
+
+## Rule 1: Multi View Agreement
+
+A feature observed from multiple viewpoints gains confidence.
+
+```text
+1 View
+   -> Candidate
+
+3 Views
+   -> Probable
+
+5 Views
+   -> Accepted
+
+Repeated Observation
+   -> Canonical
+```
+
+---
+
+## Rule 2: Semantic Consistency
+
+Generated content must align with known semantic attributes.
+
+Example:
+
+```text
+Sweet Shop
+```
+
+supports:
+
+```text
+display windows
+shop signs
+glass frontage
+```
+
+---
+
+## Rule 3: Geometric Consistency
+
+Observations projected back into 3D should agree spatially.
+
+If multiple observations intersect:
+
+```text
+Promote confidence
+```
+
+If they disagree:
+
+```text
+Conflict
+```
+
+---
+
+## Rule 4: Temporal Stability
+
+Features repeatedly observed over time become increasingly trusted.
+
+---
+
+# Drift
+
+The greatest challenge is:
+
+```text
+Drift
+```
+
+Example:
+
+Iteration 1
+
+```text
+Small chimney
+```
+
+Iteration 5
+
+```text
+Large chimney
+```
+
+Iteration 10
+
+```text
+Church tower
+```
+
+The AI gradually moves away from plausibility.
+
+---
+
+# Preventing Drift
+
+Never directly bake generated geometry.
+
+Avoid:
+
+```text
+Generate
+    ->
+Bake Mesh
+```
+
+Prefer:
+
+```text
+Generate
+    ->
+Hypothesis
+    ->
+Validation
+    ->
+Promotion
+    ->
+Mesh Update
+```
+
+Reality emerges gradually.
+
+---
+
+# Multi Observer Conflicts
+
+Observer A:
+
+```text
+Chimney
+```
+
+Observer B:
+
+```text
+Skylight
+```
+
+Both plausible.
+
+Both fit the LowLOD mesh.
+
+Store both.
+
+```yaml
+chimney:
+  confidence: 0.51
+
+skylight:
+  confidence: 0.49
+```
+
+The world remains unresolved until additional evidence arrives.
+
+---
+
+# Consensus Reality
+
+The mesh is not truth.
+
+The mesh is consensus.
+
+Reality becomes:
+
+```text
+Most Self Consistent Explanation
+```
+
+rather than:
+
+```text
+Absolute Truth
+```
+
+---
+
+# The Matrix and Déjà Vu
+
+In *The Matrix*, the repeated black cat represented a change in the underlying simulation.
+
+Applied here:
+
+Suppose a feature becomes canonical.
+
+```text
+Chimney
+```
+
+Later observations prove:
+
+```text
+Skylight
+```
+
+The accepted world model changes.
+
+This can be recorded as:
+
+```text
+Reality Revision Event
+```
+
+or:
+
+```text
+Déjà Vu Event
+```
+
+A signal that consensus reality has been rewritten.
+
+---
+
+# The Backrooms and the Green Glow
+
+The Backrooms often imply that large regions exist only partially defined.
+
+The persistent greenish illumination is interesting because:
+
+```text
+Lighting exists
+before geometry exists
+```
+
+The observer experiences:
+
+- Atmosphere
+- Scale
+- Mood
+- Illumination
+
+before the space is fully materialised.
+
+Similarly:
+
+```text
+Semantic Constraints
+```
+
+can exist before:
+
+```text
+Detailed Geometry
+```
+
+---
+
+# Resolution Rather Than Revelation
+
+The key insight is:
+
+Objects are not necessarily revealed.
+
+They are resolved.
+
+Like progressive texture streaming:
+
+```text
+Low Detail
+    ->
+Medium Detail
+    ->
+High Detail
+```
+
+Reality itself gains fidelity as observation increases.
+
+---
+
+# The Living World Model
+
+The final architecture becomes:
+
+```text
+LowLOD Mesh
+      +
+Semantic Knowledge
+      +
+Observation History
+      +
+Hypothesis Graph
+      +
+Generated Detail
+      +
+Canonical Consensus
+```
+
+where:
+
+```text
+Geometry is not truth.
+
+Observations are evidence.
+
+Hypotheses are belief.
+
+Consensus becomes reality.
+```
+
+The city is never completely defined.
+
+It continuously materialises around observers, refining itself toward the most believable and self-consistent interpretation of the world.
