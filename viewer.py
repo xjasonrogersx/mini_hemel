@@ -161,6 +161,9 @@ class ModelWindow(pyglet.window.Window):
 		self.walk_look_drag = False
 		self.walk_height = 0.0
 		self.last_click: tuple[float, int, int] | None = None
+		self.point_mode = False
+		self.points: list[dict[str, object]] = []
+		self.load_persisted_points()
 		self.color_buffer = np.zeros((WINDOW_HEIGHT, WINDOW_WIDTH, 4), dtype=np.uint8)
 		self.web_commands: queue.Queue[dict[str, object]] = queue.Queue()
 		self.web_server: ViewerWebServer | None = None
@@ -183,7 +186,37 @@ class ModelWindow(pyglet.window.Window):
 			"distance": self.distance,
 			"orbit_target": self.orbit_target.astype(float).tolist(),
 			"texture_generator": texture_config,
+			"point_mode": self.point_mode,
+			"points": self.points,
 		}
+
+	def load_persisted_points(self) -> None:
+		try:
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			if not isinstance(artifacts, list):
+				return
+			for artifact in reversed(artifacts):
+				if isinstance(artifact, dict) and isinstance(artifact.get("viewer_points"), list):
+					self.points = artifact["viewer_points"]
+					return
+		except (OSError, json.JSONDecodeError):
+			LOGGER.warning("Could not load persisted viewer points from %s", ARTIFACTS_PATH)
+
+	def persist_points(self) -> None:
+		with ARTIFACTS_LOCK:
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			if not isinstance(artifacts, list):
+				raise ValueError("artifacts.json must contain a JSON array")
+			for artifact in artifacts:
+				if isinstance(artifact, dict):
+					artifact["viewer_points"] = self.points
+			temporary_path = ARTIFACTS_PATH.with_suffix(".json.tmp")
+			with temporary_path.open("w", encoding="utf-8") as artifacts_file:
+				json.dump(artifacts, artifacts_file, indent=2)
+				artifacts_file.write("\n")
+			temporary_path.replace(ARTIFACTS_PATH)
 
 	@staticmethod
 	def _rabbitmq_url(config: dict[str, object], section_name: str, settings: object) -> str:
@@ -317,6 +350,28 @@ class ModelWindow(pyglet.window.Window):
 			self.run_building_regularization(int(command["index"]), float(command.get("aggression", 0.5)))
 		elif action == "set_options":
 			self.update_texture_options(command.get("options", {}))
+		elif action == "set_point_coordinates":
+			self.set_point_coordinates(
+				int(command["index"]), float(command["longitude"]), float(command["latitude"])
+			)
+		elif action == "arm_point_mode":
+			if self.walk_mode:
+				raise ValueError("leave walk mode before adding a point")
+			self.point_mode = True
+			self.set_caption("merged.gltf | point mode | click a visible surface")
+		elif action == "clear_points":
+			self.points.clear()
+			self.persist_points()
+			self.set_caption("merged.gltf | points cleared")
+		elif action == "delete_point":
+			index = int(command["index"])
+			if index < 0 or index >= len(self.points):
+				raise ValueError("point index is out of range")
+			self.points.pop(index)
+			self.persist_points()
+			self.set_caption("merged.gltf | point deleted")
+		elif action == "navigate_model_point":
+			self.navigate_to_model_point(float(command["x"]), float(command["z"]))
 		else:
 			raise ValueError(f"unsupported web action: {action}")
 
@@ -1343,6 +1398,20 @@ class ModelWindow(pyglet.window.Window):
 		pose[:3, 3] = camera_position
 		self.render_scene.set_pose(self.render_scene._orbit_camera_node, pose)
 
+	def navigate_to_model_point(self, x: float, z: float) -> None:
+		if not math.isfinite(x) or not math.isfinite(z):
+			raise ValueError("model point coordinates must be finite")
+		ground_y = self.lowest_triangle_y(x, z)
+		if ground_y is None:
+			ground_y = float(self.render_scene._orbit_center[1])
+		self.orbit_target = np.array([x, ground_y, z], dtype=np.float32)
+		self.distance = 100.0
+		self.yaw = 0.0
+		self.pitch = math.pi / 2.0 - 1e-3
+		self.camera.zfar = max(self.camera.zfar, self.distance * 2.0)
+		self.update_camera()
+		self.set_caption("merged.gltf | top-down point view")
+
 	def render_frame(self, _delta_time: float) -> None:
 		flags = pyrender.RenderFlags.RGBA
 		if self.mode == "depth":
@@ -1529,6 +1598,10 @@ class ModelWindow(pyglet.window.Window):
 		if symbol == pyglet.window.key.T and not self.walk_mode:
 			LOGGER.info("T pressed: starting configured texture generation")
 			self.generate_configured_texture_view()
+			return
+		if symbol == pyglet.window.key.P and not self.walk_mode:
+			self.point_mode = True
+			self.set_caption("merged.gltf | point mode | click a visible surface")
 			return
 		if symbol == pyglet.window.key.F:
 			self.set_fullscreen(not self.fullscreen)
@@ -1949,6 +2022,7 @@ class ModelWindow(pyglet.window.Window):
 					"texture_render": view_path.name,
 					"result_render": output_path.name,
 					"camera_pose": camera_pose,
+					"viewer_points": self.points,
 				}
 				artifacts.append(artifact)
 				temporary_path = ARTIFACTS_PATH.with_suffix(".json.tmp")
@@ -2104,6 +2178,17 @@ class ModelWindow(pyglet.window.Window):
 
 	def on_mouse_press(self, x: int, y: int, button: int, modifiers: int) -> None:
 		if button == pyglet.window.mouse.LEFT:
+			if self.point_mode and not self.walk_mode:
+				self.point_mode = False
+				hit = self.scene_hit(x, y)
+				if hit is None:
+					self.set_caption("merged.gltf | point mode missed the scene")
+				else:
+					point, _forward = hit
+					self.points.append({"position": point.astype(float).tolist(), "longitude": None, "latitude": None})
+					self.persist_points()
+					self.set_caption("merged.gltf | point %d added" % len(self.points))
+				return
 			if self.walk_mode:
 				self.walk_look_drag = not self.fullscreen
 				return
@@ -2173,6 +2258,20 @@ class ModelWindow(pyglet.window.Window):
 		self.update_walk_caption()
 		LOGGER.info("Entered walk mode at x=%d y=%d position=%s", x, y, camera_position.tolist())
 		return True
+
+	def set_point_coordinates(self, index: int, longitude: float, latitude: float) -> None:
+		if index < 0 or index >= len(self.points):
+			raise ValueError("point index is out of range")
+		if not math.isfinite(longitude) or not math.isfinite(latitude):
+			raise ValueError("longitude and latitude must be finite numbers")
+		if not -180.0 <= longitude <= 180.0:
+			raise ValueError("longitude must be between -180 and 180")
+		if not -90.0 <= latitude <= 90.0:
+			raise ValueError("latitude must be between -90 and 90")
+		self.points[index]["longitude"] = longitude
+		self.points[index]["latitude"] = latitude
+		self.persist_points()
+		self.set_caption("merged.gltf | point %d coordinates saved" % (index + 1))
 
 	def update_walk_caption(self) -> None:
 		self.set_caption(

@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime
 import json
 import html
 import logging
 from pathlib import Path
 import threading
 from typing import Any, Callable
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
+from urllib.request import Request, urlopen
 
 
 WEB_HOST = "127.0.0.1"
 WEB_PORT = 8765
 LOGGER = logging.getLogger(__name__)
+ARTIFACTS_LOCK = threading.Lock()
 
 
 class ViewerWebServer:
@@ -72,11 +75,34 @@ class ViewerWebServer:
                 if parsed.path in {"/", "/index.html"}:
                     self._send_bytes(CONTROL_PANEL_HTML.encode("utf-8"), "text/html; charset=utf-8")
                     return
+                if parsed.path == "/osm":
+                    self._send_bytes(OSM_PAGE_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                    return
                 if parsed.path == "/api/state":
                     self._send_json(owner.state_callback())
                     return
                 if parsed.path == "/api/artifacts":
                     self._send_json(owner._load_artifacts())
+                    return
+                if parsed.path == "/api/osm":
+                    try:
+                        query = parse_qs(parsed.query)
+                        bbox = tuple(float(query[name][0]) for name in ("south", "west", "north", "east"))
+                        self._send_json(owner._fetch_osm_buildings(bbox))
+                    except (KeyError, IndexError, TypeError, ValueError) as exc:
+                        self._send_json({"error": str(exc)}, 400)
+                    except (OSError, json.JSONDecodeError) as exc:
+                        LOGGER.warning(
+                            "OSM page accessed: path=%s upstream_status=%s error=%s",
+                            self.path,
+                            getattr(exc, "code", "unknown"),
+                            exc,
+                        )
+                        self._send_json({"error": "OpenStreetMap data request failed"}, 502)
+                    return
+                if parsed.path == "/api/osm/saved":
+                    saved = owner._load_saved_osm_result()
+                    self._send_json(saved if saved is not None else {"available": False})
                     return
                 if parsed.path.startswith("/artifact/"):
                     owner._send_artifact_page(self, parsed.path.removeprefix("/artifact/"))
@@ -128,6 +154,129 @@ class ViewerWebServer:
             return data if isinstance(data, list) else []
         except (OSError, json.JSONDecodeError):
             return []
+
+    def _fetch_osm_buildings(self, bbox: tuple[float, float, float, float]) -> dict[str, Any]:
+        south, west, north, east = bbox
+        if not (-90 <= south <= north <= 90 and -180 <= west <= east <= 180):
+            raise ValueError("invalid bounding box")
+        if north - south > 0.25 or east - west > 0.25:
+            raise ValueError("bounding box is too large; use an area no larger than 0.25 degrees")
+        overpass_query = (
+            "[out:json][timeout:60];"
+            f"way[building]({south},{west},{north},{east});out geom;"
+            f"way[highway][name]({south},{west},{north},{east});out geom;"
+            f"(node[name]({south},{west},{north},{east});"
+            f"node[amenity]({south},{west},{north},{east});way[amenity]({south},{west},{north},{east});"
+            f"node[shop]({south},{west},{north},{east});way[shop]({south},{west},{north},{east});"
+            f"node[tourism]({south},{west},{north},{east});way[tourism]({south},{west},{north},{east});"
+            f"node[historic]({south},{west},{north},{east});way[historic]({south},{west},{north},{east});"
+            f"node[leisure]({south},{west},{north},{east});way[leisure]({south},{west},{north},{east});"
+            f"node[craft]({south},{west},{north},{east});way[craft]({south},{west},{north},{east}););out center;"
+        )
+        last_error: Exception | None = None
+        data: dict[str, Any] | None = None
+        for endpoint in (
+            "https://overpass-api.de/api/interpreter",
+            "https://overpass.kumi.systems/api/interpreter",
+            "https://overpass.private.coffee/api/interpreter",
+        ):
+            request = Request(
+                endpoint,
+                data=overpass_query.encode("utf-8"),
+                headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "mini-hemel/1.0"},
+                method="POST",
+            )
+            try:
+                with urlopen(request, timeout=75) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                break
+            except (OSError, json.JSONDecodeError) as exc:
+                last_error = exc
+                LOGGER.warning("OSM Overpass endpoint failed: endpoint=%s error=%s", endpoint, exc)
+        if data is None:
+            raise OSError(f"all Overpass endpoints failed: {last_error}")
+        features = []
+        for element in data.get("elements", []):
+            geometry = element.get("geometry")
+            tags = element.get("tags", {})
+            is_building = "building" in tags
+            is_road = "highway" in tags and not is_building
+            if isinstance(geometry, list) and len(geometry) >= 2:
+                coordinates = [[float(node["lon"]), float(node["lat"])] for node in geometry]
+                is_closed = coordinates[0] == coordinates[-1]
+                if is_closed and len(coordinates) >= 4:
+                    feature_geometry = {"type": "Polygon", "coordinates": [coordinates]}
+                else:
+                    feature_geometry = {"type": "LineString", "coordinates": coordinates}
+            elif isinstance(element.get("lat"), (int, float)) and isinstance(element.get("lon"), (int, float)):
+                feature_geometry = {"type": "Point", "coordinates": [element["lon"], element["lat"]]}
+            elif isinstance(element.get("center"), dict):
+                center = element["center"]
+                feature_geometry = {"type": "Point", "coordinates": [center["lon"], center["lat"]]}
+            else:
+                continue
+            features.append({
+                "type": "Feature",
+                "id": f"{element.get('type', 'way')}/{element.get('id')}",
+                "properties": {**tags, "feature_type": "building" if is_building else "road" if is_road else "point_of_interest"}
+                if isinstance(tags, dict) else {},
+                "geometry": feature_geometry,
+            })
+        result = {
+            "type": "FeatureCollection",
+            "features": features,
+            "bbox": [west, south, east, north],
+            "source": "OpenStreetMap via Overpass API",
+        }
+        return self._store_osm_result(result)
+
+    def _load_saved_osm_result(self) -> dict[str, Any] | None:
+        for artifact in reversed(self._load_artifacts()):
+            if not isinstance(artifact, dict) or not isinstance(artifact.get("osm_data"), dict):
+                continue
+            reference = artifact["osm_data"]
+            filename = reference.get("file")
+            if not isinstance(filename, str) or Path(filename).name != filename:
+                continue
+            result_path = (self.captures_path / filename).resolve()
+            if self.captures_path not in result_path.parents or not result_path.is_file():
+                continue
+            try:
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(result, dict) and result.get("type") == "FeatureCollection":
+                result["stored_file"] = filename
+                result["artifact_reference"] = reference
+                return result
+        return None
+
+    def _store_osm_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        fetched_at = datetime.now().astimezone().isoformat()
+        filename = f"osm_data_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.geojson"
+        self.captures_path.mkdir(parents=True, exist_ok=True)
+        (self.captures_path / filename).write_text(
+            json.dumps(result, indent=2) + "\n", encoding="utf-8"
+        )
+        reference = {
+            "file": filename,
+            "fetched_at": fetched_at,
+            "bbox": result["bbox"],
+            "feature_count": len(result["features"]),
+            "source": result["source"],
+        }
+        with ARTIFACTS_LOCK:
+            artifacts = self._load_artifacts()
+            if artifacts and isinstance(artifacts[-1], dict):
+                artifacts[-1]["osm_data"] = reference
+            else:
+                artifacts.append({"created_at": fetched_at, "generator": "openstreetmap_overpass", "osm_data": reference})
+            temporary_path = self.artifacts_path.with_suffix(".json.tmp")
+            temporary_path.write_text(json.dumps(artifacts, indent=2) + "\n", encoding="utf-8")
+            temporary_path.replace(self.artifacts_path)
+        result["stored_file"] = filename
+        result["artifact_reference"] = reference
+        return result
 
     def _send_artifact_page(self, handler: BaseHTTPRequestHandler, value: str) -> None:
         try:
@@ -374,7 +523,7 @@ h1 { margin:0; font:700 30px/1.05 Georgia,serif; letter-spacing:.01em; } header 
 main { max-width:1400px; margin:auto; padding:22px clamp(18px,4vw,56px) 60px; }
 .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:end; padding-bottom:22px; border-bottom:1px solid var(--line); }
 .group { display:flex; gap:8px; align-items:center; } label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
-button, select, input { border:1px solid var(--line); background:var(--panel); color:var(--ink); border-radius:5px; padding:9px 12px; font:inherit; } button { cursor:pointer; } button:hover { border-color:var(--accent); color:#fff; } .primary { background:#8c512d; border-color:#bd7040; }
+button, a.button-link, select, input { border:1px solid var(--line); background:var(--panel); color:var(--ink); border-radius:5px; padding:9px 12px; font:inherit; } button, a.button-link { cursor:pointer; } a.button-link { text-decoration:none; } button:hover, a.button-link:hover { border-color:var(--accent); color:#fff; } .primary { background:#8c512d; border-color:#bd7040; }
 input { min-width:260px; } .status { margin-left:auto; color:var(--cyan); min-height:20px; }
 h2 { margin:28px 0 12px; font:600 20px Georgia,serif; } .assets { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px; }
 article { background:var(--panel); border:1px solid var(--line); border-radius:6px; overflow:hidden; } .meta { padding:13px 14px; } .meta strong { display:block; margin-bottom:5px; } .meta small { color:var(--muted); }
@@ -387,6 +536,7 @@ article { background:var(--panel); border:1px solid var(--line); border-radius:6
 .compare-stage { position:relative; width:100%; aspect-ratio:4/3; overflow:hidden; background:#080b10; } .compare-stage img { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
 .compare-top { clip-path:inset(0 50% 0 0); } .compare-divider { position:absolute; top:0; bottom:0; left:50%; width:2px; background:var(--accent); pointer-events:none; }
 .compare-range { width:100%; accent-color:var(--accent); }
+.points-panel { border-top:1px solid var(--line); padding-top:4px; } .point-row { display:grid; grid-template-columns:minmax(220px,1fr) minmax(220px,280px) auto auto; gap:8px; align-items:center; margin:8px 0; } .point-row input { min-width:0; width:100%; } .point-position { color:var(--muted); font-family:ui-monospace,monospace; font-size:12px; } .delete-point { padding:4px 7px; font-size:12px; } .mapping { display:flex; flex-wrap:wrap; gap:10px; align-items:end; margin-top:14px; } .mapping input { min-width:120px; } .mapping-result { color:var(--cyan); min-height:20px; } .point-help { color:var(--muted); }
 @media (max-width:700px) { header { display:block; } .status { margin:10px 0 0; } .toolbar { align-items:stretch; } input { min-width:0; width:100%; } }
 </style>
 </head>
@@ -397,9 +547,11 @@ article { background:var(--panel); border:1px solid var(--line); border-radius:6
  <div class="group"><label for="mode">Display</label><select id="mode"><option value="textured">Textured</option><option value="depth">Depth</option></select><button onclick="setMode()">Apply</button></div>
  <div class="group"><label for="navigation">Camera</label><select id="navigation"><option value="orbit">Orbit</option><option value="walk">Walk</option></select><button onclick="setNavigation()">Apply</button></div>
  <button class="primary" onclick="generate('configured')">Generate configured texture</button><button onclick="generate('sdxl')">Generate SDXL</button><button onclick="toggleEdges()">Toggle triangle edges</button><button onclick="toggleVisibleFaces()">Toggle in-view triangles</button><button onclick="toggleTexture()">Toggle texture / flat colors</button><button onclick="saveView()">Save view</button>
+ <a class="button-link" href="/osm" target="_blank">Open OSM data</a>
  <span class="status" id="status"></span>
 </section>
 <section><h2>Texture options</h2><div class="toolbar"><label for="prompt">Prompt</label><input id="prompt"><label for="resolution">Resolution</label><select id="resolution"><option>1k</option><option>2k</option><option>4k</option></select><label for="aspect">Aspect</label><select id="aspect"><option>4:3</option><option>16:9</option><option>1:1</option></select><button onclick="saveOptions()">Save options</button></div></section>
+<section class="points-panel"><h2>Point list</h2><p class="point-help">Press <strong>P</strong> in the viewer, then click a visible surface. Enter coordinates as latitude, longitude, for example 51.757353, -0.472765.</p><div class="toolbar"><button onclick="armPointMode()">Arm point mode</button><button onclick="clearPoints()">Clear points</button><span id="pointMode" class="status"></span></div><div id="points"><div class="empty">No points recorded.</div></div><div class="mapping"><label for="queryX">Model X</label><input id="queryX" type="number" step="any" oninput="updateMapping()"><label for="queryZ">Model Z</label><input id="queryZ" type="number" step="any" oninput="updateMapping()"><span id="mappingResult" class="mapping-result"></span></div></section>
 <section><h2>Generated assets</h2><div class="assets" id="assets"><div class="empty">Loading artifacts...</div></div></section>
 </main>
 <script>
@@ -414,11 +566,44 @@ async function toggleTexture(){ try { await post({action:'toggle_texture'}); not
 async function generate(generator){ try { await post({action:'generate',generator}); notice('Generation started'); } catch(e){notice(e.message)} }
 async function saveView(){ try { await post({action:'save_view'}); notice('View capture started'); } catch(e){notice(e.message)} }
 async function saveOptions(){ try { await post({action:'set_options',options:{prompt:$('prompt').value,resolution:$('resolution').value,aspect_ratio:$('aspect').value}}); notice('Options saved'); } catch(e){notice(e.message)} }
+async function armPointMode(){ try { await post({action:'arm_point_mode'}); notice('Point mode armed in viewer'); } catch(e){notice(e.message)} }
+async function clearPoints(){ try { await post({action:'clear_points'}); notice('Point list cleared'); load(); } catch(e){notice(e.message)} }
+async function deletePoint(index){ try { await post({action:'delete_point',index}); stateCache.points.splice(index,1); renderPoints(stateCache.points); notice('Point deleted'); } catch(e){notice(e.message)} }
+async function savePointCoordinates(index){ const row=document.querySelector('[data-point-index="'+index+'"]'); const values=row.querySelector('.coordinates').value.split(',').map(value=>Number(value.trim())); const latitude=values[0],longitude=values[1]; if(values.length!==2||!Number.isFinite(longitude)||!Number.isFinite(latitude)){notice('Enter coordinates as latitude, longitude');return;} try { await post({action:'set_point_coordinates',index,longitude,latitude}); stateCache.points[index].latitude=latitude; stateCache.points[index].longitude=longitude; renderPoints(stateCache.points); notice('Point coordinates saved'); } catch(e){notice(e.message)} }
+let stateCache={points:[],point_mode:false};
+function renderPoints(points){ const root=$('points'); const drafts=Array.from(root.querySelectorAll('.coordinates')).map(input=>input.value); $('pointMode').textContent=stateCache.point_mode?'Point mode armed in viewer':''; if(!points.length){root.innerHTML='<div class="empty">No points recorded.</div>'; updateMapping(); return;} root.innerHTML=points.map((point,index)=>{ const position=point.position||[]; const coordinates=Number.isFinite(Number(point.latitude))&&Number.isFinite(Number(point.longitude))?Number(point.latitude)+', '+Number(point.longitude):(drafts[index]||''); return '<div class="point-row" data-point-index="'+index+'"><div class="point-position">Point '+(index+1)+' · ['+position.map(value=>Number(value).toFixed(4)).join(', ')+']</div><input class="coordinates" type="text" placeholder="latitude, longitude" value="'+coordinates+'"><button onclick="savePointCoordinates('+index+')">Save</button><button class="delete-point" onclick="deletePoint('+index+')">Delete</button></div>'; }).join(''); updateMapping(); }
+function solveLeastSquares(matrix,values){ const size=3; const normal=Array.from({length:size},(_,row)=>Array.from({length:size},(_,column)=>matrix.reduce((sum,entry)=>sum+entry[row]*entry[column],0))); const rhs=Array.from({length:size},(_,row)=>matrix.reduce((sum,entry,index)=>sum+entry[row]*values[index],0)); for(let pivot=0;pivot<size;pivot++){ let best=pivot; for(let row=pivot+1;row<size;row++) if(Math.abs(normal[row][pivot])>Math.abs(normal[best][pivot])) best=row; if(Math.abs(normal[best][pivot])<1e-12) return null; [normal[pivot],normal[best]]=[normal[best],normal[pivot]]; [rhs[pivot],rhs[best]]=[rhs[best],rhs[pivot]]; for(let row=pivot+1;row<size;row++){ const factor=normal[row][pivot]/normal[pivot][pivot]; for(let column=pivot;column<size;column++) normal[row][column]-=factor*normal[pivot][column]; rhs[row]-=factor*rhs[pivot]; } } const result=Array(size); for(let row=size-1;row>=0;row--) result[row]=(rhs[row]-normal[row].slice(row+1).reduce((sum,value,column)=>sum+value*result[row+column+1],0))/normal[row][row]; return result; }
+function updateMapping(){ const result=$('mappingResult'); const x=Number($('queryX').value),z=Number($('queryZ').value); const known=stateCache.points.filter(point=>Number.isFinite(Number(point.longitude))&&Number.isFinite(Number(point.latitude))&&point.position?.length>=3); if(known.length<2||!Number.isFinite(x)||!Number.isFinite(z)){result.textContent=known.length<2?'Add coordinates to at least two points':'Enter model X and Z';return;} let longitude,latitude; if(known.length===2){ const first=known[0],second=known[1],dx=Number(second.position[0])-Number(first.position[0]),dz=Number(second.position[2])-Number(first.position[2]),dlon=Number(second.longitude)-Number(first.longitude),dlat=Number(second.latitude)-Number(first.latitude),den=dx*dx+dz*dz; if(den<1e-12){result.textContent='The two model points must be different';return;} const scale=(dlon*dx+dlat*dz)/den,turn=(dlat*dx-dlon*dz)/den,qx=x-Number(first.position[0]),qz=z-Number(first.position[2]); longitude=Number(first.longitude)+scale*qx-turn*qz; latitude=Number(first.latitude)+turn*qx+scale*qz; } else { const matrix=known.map(point=>[Number(point.position[0]),Number(point.position[2]),1]); const longitudeCoefficients=solveLeastSquares(matrix,known.map(point=>Number(point.longitude))); const latitudeCoefficients=solveLeastSquares(matrix,known.map(point=>Number(point.latitude))); if(!longitudeCoefficients||!latitudeCoefficients){result.textContent='The model points must not be collinear';return;} longitude=longitudeCoefficients[0]*x+longitudeCoefficients[1]*z+longitudeCoefficients[2]; latitude=latitudeCoefficients[0]*x+latitudeCoefficients[1]*z+latitudeCoefficients[2]; } result.textContent='Mapped longitude '+longitude.toFixed(8)+' · latitude '+latitude.toFixed(8); }
 function image(name,label){ if(!name) return '<figure><div style="aspect-ratio:4/3"></div><figcaption>'+label+' unavailable</figcaption></figure>'; return '<figure><img loading="lazy" src="/captures/'+encodeURIComponent(name)+'" alt="'+label+'"><figcaption>'+name+'</figcaption></figure>'; }
 let artifacts=[];
 function renderAssets(items){ artifacts=items; const root=$('assets'); if(!items.length){root.innerHTML='<div class="empty">No artifact records yet.</div>';return;} root.innerHTML=items.slice().reverse().map((a,i)=>'<article><div class="meta"><strong>'+((a.generator||'generated')+' · '+(a.created_at||''))+'</strong><small>Camera yaw '+Number(a.camera_pose?.yaw||0).toFixed(3)+' · pitch '+Number(a.camera_pose?.pitch||0).toFixed(3)+' · distance '+Number(a.camera_pose?.distance||0).toFixed(2)+'</small></div><div class="images">'+image(a.texture_render,'Texture input')+image(a.result_render,'Generated result')+image(a.depth_render,'Renderer depth')+image(a.generated_depth_render,'Depth Anything')+'</div><div class="actions"><a href="/artifact/'+items.indexOf(a)+'">Open artifact</a><button onclick="navigateAsset('+items.indexOf(a)+')">Navigate display</button></div></article>').join(''); }
 async function navigateAsset(index){ try { await post({action:'navigate',index}); notice('Display moved to asset camera'); } catch(e){notice(e.message)} }
-async function load(){ try { const [state,items]=await Promise.all([fetch('/api/state').then(r=>r.json()),fetch('/api/artifacts').then(r=>r.json())]); $('state').textContent=state.mode+' · '+(state.walk_mode?'walk':'orbit'); $('mode').value=state.mode; $('navigation').value=state.walk_mode?'walk':'orbit'; const t=state.texture_generator||{}; $('prompt').value=t.prompt||''; $('resolution').value=t.resolution||'1k'; $('aspect').value=t.aspect_ratio||'4:3'; renderAssets(items); } catch(e){$('state').textContent='Offline';} }
-load(); setInterval(load,5000);
+async function load(){ try { const [state,items]=await Promise.all([fetch('/api/state').then(r=>r.json()),fetch('/api/artifacts').then(r=>r.json())]); stateCache=state; $('state').textContent=state.mode+' · '+(state.walk_mode?'walk':'orbit'); $('mode').value=state.mode; $('navigation').value=state.walk_mode?'walk':'orbit'; const t=state.texture_generator||{}; $('prompt').value=t.prompt||''; $('resolution').value=t.resolution||'1k'; $('aspect').value=t.aspect_ratio||'4:3'; renderPoints(state.points||[]); renderAssets(items); } catch(e){$('state').textContent='Offline';} }
+load();
 </script>
 </body></html>"""
+
+
+OSM_PAGE_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>OSM building data | Mini Hemel</title>
+<style>
+:root { color-scheme:dark; --ink:#e9edf4; --muted:#93a0b4; --panel:#18202b; --line:#2b384a; --accent:#f0a35b; --cyan:#75d0c5; }
+* { box-sizing:border-box; } body { margin:0; background:#0d131b; color:var(--ink); font:14px/1.45 ui-sans-serif,system-ui,sans-serif; } main { max-width:1400px; margin:auto; padding:24px clamp(18px,4vw,56px) 60px; } h1,h2 { font-family:Georgia,serif; } h1 { margin:0; } h2 { margin:28px 0 12px; } .muted { color:var(--muted); } .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:end; padding:16px 0; border-bottom:1px solid var(--line); } label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; } input,button,a.button-link { border:1px solid var(--line); background:var(--panel); color:var(--ink); border-radius:5px; padding:9px 12px; font:inherit; } button,a.button-link { cursor:pointer; text-decoration:none; } button:hover,a.button-link:hover { border-color:var(--accent); } input { width:130px; } #status { color:var(--cyan); min-height:22px; } table { width:100%; border-collapse:collapse; background:var(--panel); } th,td { border:1px solid var(--line); padding:8px; text-align:left; vertical-align:top; } th { color:var(--muted); } td { max-width:320px; overflow-wrap:anywhere; } pre { white-space:pre-wrap; background:#080b10; border:1px solid var(--line); padding:12px; max-height:360px; overflow:auto; } .map { width:100%; height:420px; background:#080b10; border:1px solid var(--line); } .map polygon { fill:rgba(240,163,91,.24); stroke:var(--accent); stroke-width:.8; } .map polyline { fill:none; stroke:var(--cyan); stroke-width:.8; } .map circle { fill:var(--cyan); } @media(max-width:700px){ .toolbar { align-items:stretch; } input { width:100%; } }
+</style></head><body><main><p><a href="/">&larr; Control panel</a></p><h1>OpenStreetMap building data</h1><p class="muted">Fetches complete building outline geometry and OSM tags through the Overpass API. The area is initialized from saved points with geographic coordinates.</p>
+<div class="toolbar"><label>South <input id="south" type="number" step="any"></label><label>West <input id="west" type="number" step="any"></label><label>North <input id="north" type="number" step="any"></label><label>East <input id="east" type="number" step="any"></label><button onclick="fetchBuildings()">Load buildings</button><button onclick="downloadGeoJson()" id="download" disabled>Download GeoJSON</button><span id="status"></span></div>
+<h2>Buildings, roads, and points of interest</h2><svg id="map" class="map" viewBox="0 0 1000 600" aria-label="OpenStreetMap features"></svg><p id="count" class="muted">No data loaded.</p><table><thead><tr><th>OSM ID</th><th>Name</th><th>Address</th><th>Type</th><th>Other tags</th><th>View</th></tr></thead><tbody id="rows"></tbody></table><h2>GeoJSON</h2><pre id="json">No data loaded.</pre></main>
+<script>
+let geojson=null; const $=id=>document.getElementById(id); function status(text){$('status').textContent=text;}
+async function init(){ try { const [state,saved]=await Promise.all([fetch('/api/state').then(response=>response.json()),fetch('/api/osm/saved').then(response=>response.json())]); const points=(state.points||[]).filter(point=>Number.isFinite(Number(point.latitude))&&Number.isFinite(Number(point.longitude))); window.savedPoints=points; if(points.length>=2){ const latitudes=points.map(point=>Number(point.latitude)),longitudes=points.map(point=>Number(point.longitude)),padding=Math.max(Math.max(...latitudes)-Math.min(...latitudes),Math.max(...longitudes)-Math.min(...longitudes),0.001)*0.1; $('south').value=(Math.min(...latitudes)-padding).toFixed(7); $('west').value=(Math.min(...longitudes)-padding).toFixed(7); $('north').value=(Math.max(...latitudes)+padding).toFixed(7); $('east').value=(Math.max(...longitudes)+padding).toFixed(7); } if(saved.available!==false){ renderGeoJson(saved,'Loaded saved OSM data: '+saved.stored_file); } else if(points.length<2){ status('Add at least two points with coordinates on the control panel.'); } } catch(error){status('Could not load saved OSM data: '+error.message);} }
+function escapeHtml(value){ const element=document.createElement('span'); element.textContent=String(value??''); return element.innerHTML; }
+function renderGeoJson(data,loadedMessage){ geojson=data; $('json').textContent=JSON.stringify(geojson,null,2); const buildings=geojson.features.filter(feature=>feature.properties?.feature_type==='building').length,roads=geojson.features.filter(feature=>feature.properties?.feature_type==='road').length,pois=geojson.features.length-buildings-roads; $('count').textContent=buildings+' building outlines, '+roads+' named roads, and '+pois+' points of interest loaded'; $('rows').innerHTML=geojson.features.map((feature,index)=>{const tags=feature.properties||{},address=[tags['addr:housenumber'],tags['addr:street'],tags['addr:postcode']].filter(Boolean).join(', '),known=new Set(['name','addr:housenumber','addr:street','addr:postcode','building','highway','feature_type']); const other=Object.entries(tags).filter(([key])=>!known.has(key)).map(([key,value])=>escapeHtml(key)+'='+escapeHtml(value)).join('; '); return '<tr><td>'+escapeHtml(feature.id)+'</td><td>'+escapeHtml(tags.name)+'</td><td>'+escapeHtml(address)+'</td><td>'+escapeHtml(tags.building||tags.highway||tags.feature_type)+'</td><td>'+other+'</td><td><button onclick="navigateFeature('+index+')">Navigate</button></td></tr>';}).join(''); drawMap(); $('download').disabled=false; status(loadedMessage); }
+function representativeCoordinate(feature){ const geometry=feature.geometry;if(geometry.type==='Point') return geometry.coordinates;if(geometry.type==='LineString') return geometry.coordinates[Math.floor(geometry.coordinates.length/2)];if(geometry.type==='Polygon'){const ring=geometry.coordinates[0];return ring.reduce((sum,coordinate)=>[sum[0]+coordinate[0],sum[1]+coordinate[1]],[0,0]).map(value=>value/ring.length);}return null; }
+function solveLeastSquares(matrix,values){ const size=3; const normal=Array.from({length:size},(_,row)=>Array.from({length:size},(_,column)=>matrix.reduce((sum,entry)=>sum+entry[row]*entry[column],0))); const rhs=Array.from({length:size},(_,row)=>matrix.reduce((sum,entry,index)=>sum+entry[row]*values[index],0)); for(let pivot=0;pivot<size;pivot++){ let best=pivot; for(let row=pivot+1;row<size;row++) if(Math.abs(normal[row][pivot])>Math.abs(normal[best][pivot])) best=row; if(Math.abs(normal[best][pivot])<1e-12) return null; [normal[pivot],normal[best]]=[normal[best],normal[pivot]]; [rhs[pivot],rhs[best]]=[rhs[best],rhs[pivot]]; for(let row=pivot+1;row<size;row++){ const factor=normal[row][pivot]/normal[pivot][pivot]; for(let column=pivot;column<size;column++) normal[row][column]-=factor*normal[pivot][column]; rhs[row]-=factor*rhs[pivot]; } } const result=Array(size); for(let row=size-1;row>=0;row--) result[row]=(rhs[row]-normal[row].slice(row+1).reduce((sum,value,column)=>sum+value*result[row+column+1],0))/normal[row][row]; return result; }
+function invertGeoPoint(longitude,latitude){ const points=(window.savedPoints||[]).filter(point=>Number.isFinite(Number(point.longitude))&&Number.isFinite(Number(point.latitude))&&point.position?.length>=3);if(points.length<2) throw Error('At least two calibrated points are required');if(points.length>=3){ const matrix=points.map(point=>[Number(point.longitude),Number(point.latitude),1]),xCoefficients=solveLeastSquares(matrix,points.map(point=>Number(point.position[0]))),zCoefficients=solveLeastSquares(matrix,points.map(point=>Number(point.position[2])));if(!xCoefficients||!zCoefficients) throw Error('Calibrated geographic points must not be collinear');return {x:xCoefficients[0]*longitude+xCoefficients[1]*latitude+xCoefficients[2],z:zCoefficients[0]*longitude+zCoefficients[1]*latitude+zCoefficients[2]}; }const first=points[0],second=points[1],dx=Number(second.position[0])-Number(first.position[0]),dz=Number(second.position[2])-Number(first.position[2]),dlon=Number(second.longitude)-Number(first.longitude),dlat=Number(second.latitude)-Number(first.latitude),den=dlon*dlon+dlat*dlat;if(den<1e-12) throw Error('Calibrated geographic points must be different');const scale=(dx*dlon+dz*dlat)/den,turn=(dz*dlon-dx*dlat)/den;return {x:Number(first.position[0])+scale*(longitude-Number(first.longitude))-turn*(latitude-Number(first.latitude)),z:Number(first.position[2])+turn*(longitude-Number(first.longitude))+scale*(latitude-Number(first.latitude))}; }
+async function navigateFeature(index){ try { const coordinate=representativeCoordinate(geojson.features[index]);if(!coordinate) throw Error('Feature has no navigable geometry');const model=invertGeoPoint(coordinate[0],coordinate[1]);const response=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'navigate_model_point',x:model.x,z:model.z})});const result=await response.json();if(!result.ok) throw Error(result.error);status('Viewer moved to selected feature, looking down.'); } catch(error){status(error.message);} }
+async function fetchBuildings(){ const params=new URLSearchParams({south:$('south').value,west:$('west').value,north:$('north').value,east:$('east').value}); status('Loading OSM building and point-of-interest data...'); $('download').disabled=true; try { const response=await fetch('/api/osm?'+params); const data=await response.json(); if(!response.ok) throw Error(data.error||'Overpass request failed'); renderGeoJson(data,'Loaded fresh data from OpenStreetMap via Overpass.'); } catch(error){status(error.message);$('count').textContent='No data loaded.';} }
+function projectPoint(coordinate,bbox){ const [west,south,east,north]=bbox,dx=Math.max(east-west,1e-9),dy=Math.max(north-south,1e-9); return ((coordinate[0]-west)/dx*960+20)+','+(600-(coordinate[1]-south)/dy*560-20); }
+function drawMap(){ const svg=$('map'); svg.innerHTML=geojson.features.map(feature=>{const geometry=feature.geometry;if(geometry.type==='Polygon') return '<polygon points="'+geometry.coordinates[0].map(coordinate=>projectPoint(coordinate,geojson.bbox)).join(' ')+'"/>';if(geometry.type==='LineString') return '<polyline points="'+geometry.coordinates.map(coordinate=>projectPoint(coordinate,geojson.bbox)).join(' ')+'"/>';if(geometry.type==='Point'){const [x,y]=projectPoint(geometry.coordinates,geojson.bbox).split(',');return '<circle cx="'+x+'" cy="'+y+'" r="3"/>';}return '';}).join(''); }
+function downloadGeoJson(){ if(!geojson)return; const link=document.createElement('a'); link.href=URL.createObjectURL(new Blob([JSON.stringify(geojson,null,2)],{type:'application/geo+json'})); link.download='osm-buildings.geojson'; link.click(); URL.revokeObjectURL(link.href); }
+init();
+</script></body></html>"""
