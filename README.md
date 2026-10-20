@@ -115,7 +115,6 @@ python3 model_server/controlnet_worker.py \
   --controlnet lllyasviel/sd-controlnet-depth
 python3 viewer.py
 ```
-
 The generated image is saved in `captures/` as `view_controlnet_<timestamp>.png`.
 
 ## SDXL textured renders
@@ -202,23 +201,4 @@ python3 model_server/sam2_worker.py \
   --model sam2_b.pt \
   --queue sam2 \
   --rabbitmq-url amqp://guest:guest@192.168.1.220:5672/%2F
-```
-
-
-```bash
-
-cd /workspace
-git clone https://github.com/lhwcv/mlsd_pytorch.git
-mkdir -p /workspace/mlsd_pytorch/models
-wget -O /workspace/mlsd_pytorch/models/mlsd_large_512_fp32.pth \
-  https://github.com/lhwcv/mlsd_pytorch/raw/main/models/mlsd_large_512_fp32.pth
-
-
-cd /workspace/mini_hemel
-python3 model_server/mlsd_worker.py \
-  --model /workspace/mlsd_pytorch/models/mlsd_large_512_fp32.pth \
-  --source-dir /workspace/mlsd_pytorch \
-  --queue mlsd \
-  --input-size 512 \
-  --rabbitmq-url 'amqp://guest:guest@192.168.1.220:5672/%2F'
 ```
