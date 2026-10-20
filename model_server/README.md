@@ -3,6 +3,13 @@
 These workers run on the machine with the larger memory/GPU. The viewer sends
 jobs through RabbitMQ and receives results through RabbitMQ RPC replies.
 
+The M-LSD worker uses OpenCV. On Ubuntu containers, install the GLib runtime
+before importing `cv2`:
+
+```bash
+apt-get update && apt-get install -y libglib2.0-0
+```
+
 The workers use separate queues so they can run independently:
 
 | Worker | Script | Queue | Result |

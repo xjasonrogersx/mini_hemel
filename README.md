@@ -23,6 +23,7 @@ docker run -it --name god \
 apt-get update && apt-get install -y \
   python3 python3-pip \
   libgl1 libglx0 libegl1 libgl1-mesa-dri \
+  libglib2.0-0 \
   libglu1-mesa \
   libx11-6 libxext6 libxi6 libxfixes3 libxrandr2 libxxf86vm1
 pip config set global.break-system-packages true
@@ -140,6 +141,15 @@ Starting `viewer.py` also starts a local control panel at
 texture options, generation controls, and the entries in `artifacts.json`.
 Each artifact shows its captured and generated images; **Navigate display**
 restores the saved camera pose. Set `VIEWER_WEB_PORT` to use another port.
+
+### Artifact flow graph
+
+Each artifact page includes a LiteGraph.js view of the available processing
+stages. The graph starts at configured texture generation, branches into Depth
+Anything, SegFormer, Mask2Former, M-LSD outline detection, and Grounding DINO,
+then continues from Grounding DINO to SAM2. Double-click an actionable node to
+send the existing viewer command; the graph polls the artifact record and
+updates node status as outputs are saved.
 
 ## Configured texture render
 

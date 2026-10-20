@@ -362,6 +362,22 @@ class ViewerWebServer:
             f'<ul>{detection_rows}</ul>' if detection_rows else '<p class="muted">No detections yet.</p>'
         )
         dino_image = artifact.get("result_render") or ""
+        detections = artifact.get("grounding_dino_detections", {})
+        has_sam2_masks = any(
+            isinstance(detection, dict) and detection.get("sam2_mask")
+            for group in (detections.values() if isinstance(detections, dict) else detections or [])
+            for detection in (group if isinstance(group, list) else [])
+        )
+        flow_status = {
+            "capture": "completed" if artifact.get("texture_render") else "unavailable",
+            "configured_texture": "completed" if artifact.get("result_render") else "unavailable",
+            "depth_anything": "completed" if artifact.get("generated_depth_render") else "ready",
+            "segformer": "completed" if artifact.get("segmentation_label_map") else "ready",
+            "mask2former": "completed" if artifact.get("mask2former_label_map") else "ready",
+            "outline_detection": str(artifact.get("outline_detection_status") or "ready"),
+            "grounding_dino": "completed" if artifact.get("grounding_dino_detections") else "ready",
+            "sam2": "completed" if has_sam2_masks else "ready",
+        }
         pose = artifact.get("camera_pose", {})
         page = ARTIFACT_PAGE_HTML.format(
             index=index,
@@ -378,6 +394,7 @@ class ViewerWebServer:
             fields=json.dumps({field: filename for field, _label, filename in available}),
             detection_report=detection_report,
             outline_status=html.escape(str(artifact.get("outline_detection_status", "not started"))),
+            flow_status=json.dumps(flow_status),
             dino_image=html.escape(dino_image),
             detections_json=json.dumps(detections),
             detection_targets=json.dumps([
@@ -413,15 +430,43 @@ button,select,input {{ border:1px solid var(--line); background:var(--panel); bo
 .controls {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:14px 0; }} .stage {{ position:relative; aspect-ratio:4/3; max-width:900px; background:#080b10; overflow:hidden; }} .stage img {{ position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }} .top {{ clip-path:inset(0 50% 0 0); }} .divider {{ position:absolute; top:0; bottom:0; left:50%; width:2px; background:var(--accent); pointer-events:none; }} .range {{ width:min(900px,100%); accent-color:var(--accent); }} .status {{ color:var(--cyan); }}
 .dino-stage {{ position:relative; width:min(900px,100%); background:#080b10; }} .dino-stage img {{ display:block; width:100%; height:auto; }} .dino-stage canvas {{ position:absolute; inset:0; width:100%; height:100%; }}
 .operation {{ margin:18px 0; padding:16px; background:var(--panel); border:1px solid var(--line); border-left:3px solid var(--accent); border-radius:6px; }} .operation h2 {{ margin:0 0 8px; }} .operation .range {{ width:min(420px,100%); vertical-align:middle; }} .operation output {{ display:inline-block; min-width:3em; color:var(--cyan); }}
+.flow-operation {{ overflow:hidden; }} #artifactFlow {{ display:block; width:100%; min-height:320px; border:1px solid var(--line); background:#0a0f16; }}
 </style></head><body><main>
 <div class="head"><div><a href="/">&larr; All artifacts</a><h1>{title}</h1><div class="muted">{generator} &middot; {created_at}</div></div><div class="muted">yaw {yaw} &middot; pitch {pitch} &middot; distance {distance}</div></div>
 <p><button onclick="navigate()">Navigate display to this pose</button> <button onclick="segment()">Run / rerun SegFormer</button> <button onclick="mask2former()">Run / rerun Mask2Former</button> <button onclick="depthAnything()">Run / rerun Depth Anything on generated result</button> <span id="status" class="status"></span></p>
+<section class="operation flow-operation"><h2>Artifact flow</h2><p class="muted">Double-click an actionable node to run the existing stage. The graph refreshes as artifact outputs are persisted.</p><canvas id="artifactFlow" width="1120" height="520"></canvas><p id="flowStatus" class="muted"></p></section>
 <section class="operation"><h2>Outline detection</h2><p class="muted">Runs M-LSD on the generated or source image and saves the detected architectural line map for comparison.</p><p class="muted">Status: {outline_status}</p><p><button onclick="runMlsd()">Run / rerun outline detection</button></p></section>
 <h2>Artifact images</h2><div class="images">{images}</div>
 <h2>Compare images from this artifact</h2><div class="controls"><label for="imageA">Image A</label><select id="imageA" onchange="updateCompare()">{options}</select><label for="imageB">Image B</label><select id="imageB" onchange="updateCompare()">{options}</select></div>
 <div class="stage"><img id="bottom" src="/captures/{first_image}" alt="Image B"><img id="top" class="top" src="/captures/{second_image}" alt="Image A"><div id="divider" class="divider"></div></div><label for="slider">Swipe position</label><br><input id="slider" class="range" type="range" min="0" max="100" value="50" oninput="updateCompare()">
 <h2>Grounding DINO</h2><div class="controls"><label for="dinoPrompt">Text prompt</label><input id="dinoPrompt" value="door"><button onclick="groundingDino()">Run / rerun Grounding DINO</button><button onclick="sam2All()">Run SAM2 on all boxes</button></div>{detection_report}<div class="dino-stage"><img id="dinoImage" src="/captures/{dino_image}" alt="Generated result image for Grounding DINO" onerror="this.alt='Generated result image unavailable'"><canvas id="dinoCanvas"></canvas></div>
+<script src="https://cdn.jsdelivr.net/npm/litegraph.js@0.7.18/build/litegraph.min.js"></script>
 <script>
+const flowInitialStatus={flow_status};
+const flowIndex={index};
+const flowStages=[
+ {{id:'capture',title:'Capture artifact view',status:flowInitialStatus.capture,x:30,y:210,action:null}},
+ {{id:'configured_texture',title:'Generate configured texture',status:flowInitialStatus.configured_texture,x:280,y:210,action:'generate'}},
+ {{id:'depth_anything',title:'Depth Anything',status:flowInitialStatus.depth_anything,x:560,y:30,action:'depth_anything'}},
+ {{id:'segformer',title:'SegFormer',status:flowInitialStatus.segformer,x:560,y:150,action:'segment'}},
+ {{id:'mask2former',title:'Mask2Former',status:flowInitialStatus.mask2former,x:560,y:270,action:'mask2former'}},
+ {{id:'outline_detection',title:'M-LSD outline detection',status:flowInitialStatus.outline_detection,x:560,y:390,action:'mlsd'}},
+ {{id:'grounding_dino',title:'Grounding DINO',status:flowInitialStatus.grounding_dino,x:830,y:150,action:'grounding_dino'}},
+ {{id:'sam2',title:'SAM2 masks',status:flowInitialStatus.sam2,x:830,y:300,action:'sam2_all'}}
+];
+const flowEdges=[['capture','configured_texture'],['configured_texture','depth_anything'],['configured_texture','segformer'],['configured_texture','mask2former'],['configured_texture','outline_detection'],['configured_texture','grounding_dino'],['grounding_dino','sam2']];
+function flowStatusColor(status) {{ return {{completed:'#75d0c5',running:'#f0a35b',failed:'#e66b6b',ready:'#d9b36c',unavailable:'#687589'}}[status]||'#93a0b4'; }}
+function FlowStageNode() {{ this.addInput('input','stage'); this.addOutput('output','stage'); this.size=[220,74]; this.properties={{stageId:'',status:'ready',action:null}}; }}
+FlowStageNode.title='Artifact stage';
+FlowStageNode.prototype.onDrawForeground=function(context) {{ const color=flowStatusColor(this.properties.status); context.fillStyle=color; context.beginPath(); context.arc(12,14,5,0,Math.PI*2); context.fill(); context.fillStyle='#93a0b4'; context.font='12px sans-serif'; context.fillText(this.properties.status,24,18); if(this.properties.action) {{ context.fillStyle='#75d0c5'; context.font='11px sans-serif'; context.fillText('double-click to run',12,this.size[1]-10); }} }};
+FlowStageNode.prototype.onDblClick=function() {{ if(this.properties.action) runFlowAction(this.properties.action); }};
+if(window.LiteGraph) {{ LiteGraph.registerNodeType('mini-hemel/stage',FlowStageNode); }}
+let flowGraph=null;
+function buildFlow() {{ const canvas=document.getElementById('artifactFlow'); if(!canvas || !window.LiteGraph) {{ document.getElementById('flowStatus').textContent='Flow graph library could not be loaded.'; return; }} flowGraph=new LGraph(); const graphCanvas=new LGraphCanvas(canvas,flowGraph); graphCanvas.background_image=null; const nodes={{}}; flowStages.forEach(stage=>{{ const node=LiteGraph.createNode('mini-hemel/stage'); node.title=stage.title; node.pos=[stage.x,stage.y]; node.properties={{stageId:stage.id,status:stage.status,action:stage.action}}; nodes[stage.id]=node; flowGraph.add(node); }}); flowEdges.forEach(([from,to])=>nodes[from].connect(0,nodes[to],0)); graphCanvas.resize(); flowGraph.start(); updateFlowSummary(); }}
+function updateFlowSummary() {{ const ready=flowStages.filter(stage=>stage.action && stage.status==='ready').length; const completed=flowStages.filter(stage=>stage.status==='completed').length; document.getElementById('flowStatus').textContent=completed+' completed · '+ready+' ready to run'; }}
+async function runFlowAction(action) {{ const status=document.getElementById('status'); const body=action==='generate'?{{action:'generate',generator:'configured'}}:{{action,index:flowIndex}}; status.textContent='Starting '+action+'...'; try {{ const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(body)}}); const data=await response.json(); if(!data.ok) throw Error(data.error); status.textContent='Started '+action; if(action==='generate') return; }} catch(error) {{ status.textContent=error.message; }} }}
+async function refreshFlow() {{ try {{ const items=await fetch('/api/artifacts',{{cache:'no-store'}}).then(response=>response.json()); const artifact=items[flowIndex]; if(!artifact || !flowGraph) return; const statuses={{capture:artifact.texture_render?'completed':'unavailable',configured_texture:artifact.result_render?'completed':'unavailable',depth_anything:artifact.generated_depth_render?'completed':'ready',segformer:artifact.segmentation_label_map?'completed':'ready',mask2former:artifact.mask2former_label_map?'completed':'ready',outline_detection:artifact.outline_detection_status||'ready',grounding_dino:artifact.grounding_dino_detections?'completed':'ready',sam2:Object.values(artifact.grounding_dino_detections||{{}}).flat().some(detection=>detection.sam2_mask)?'completed':'ready'}}; flowGraph._nodes.forEach(node=>{{ node.properties.status=statuses[node.properties.stageId]||'ready'; const stage=flowStages.find(item=>item.id===node.properties.stageId); if(stage) stage.status=node.properties.status; node.setDirtyCanvas(true,true); }}); updateFlowSummary(); }} catch(error) {{ document.getElementById('flowStatus').textContent='Flow refresh failed: '+error.message; }} }}
+buildFlow(); setInterval(refreshFlow,2500);
 async function navigate() {{ const status=document.getElementById('status'); status.textContent='Navigating...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'navigate',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Display moved to this pose':data.error; }}
 async function segment() {{ const status=document.getElementById('status'); status.textContent='Starting SegFormer...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'segment',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'SegFormer started; refresh this page when complete':data.error; }}
 async function mask2former() {{ const status=document.getElementById('status'); status.textContent='Starting Mask2Former...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'mask2former',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Mask2Former started; refresh this page when complete':data.error; }}
