@@ -141,6 +141,29 @@ texture options, generation controls, and the entries in `artifacts.json`.
 Each artifact shows its captured and generated images; **Navigate display**
 restores the saved camera pose. Set `VIEWER_WEB_PORT` to use another port.
 
+The main control panel includes **Global refinement**. Its `0–5 m` grid
+slider quantizes the full scene and removes redundant coincident mesh vertices;
+the default grid size is `0.1 m`. Run the operation, then deploy the generated
+refined mesh from the same section.
+
+Artifact pages also include **Building geometry**. Choose a SegFormer or
+Mask2Former source (Mask2Former is selected by default), run the building-only geometry test, then deploy the
+generated GLB when the status is complete. Only mask filenames containing
+`_building_` are accepted; roads and sidewalks are excluded from this phase.
+The **Aggressiveness** slider defaults to 65%, matching the original behavior,
+and reaches 200% for a much stronger plane pull and displacement limit.
+The **prefer vertical / horizontal planes** option is enabled by default and
+biases RANSAC toward world-axis-aligned walls and roofs while retaining a
+fallback for sloped geometry.
+
+The **Outline detection** section can rerun M-LSD to capture exact line
+coordinates, then use **Snap to vertical** to pull front-facing triangle edges
+toward nearby detected lines. The snap range is 0–1 m and defaults to 0.5 m;
+each affected vertex uses the average of its proposed snapped positions.
+The same section has a vertical-angle tolerance slider for M-LSD; lines within
+the selected tolerance are drawn green in the generated outline PNG. Rerun
+M-LSD after changing the tolerance to regenerate the colored image.
+
 ## Configured texture render
 
 Press `T` to read `config.json` and use the configured texture generator. For

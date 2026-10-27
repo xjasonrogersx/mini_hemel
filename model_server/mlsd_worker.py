@@ -58,6 +58,7 @@ class MLSDWorker:
 		image = self._decode_image(request["image_base64"])
 		height, width = image.shape[:2]
 		threshold = float(request.get("score_threshold", 0.20))
+		vertical_tolerance_degrees = float(np.clip(request.get("vertical_tolerance_degrees", 10.0), 0.0, 45.0))
 		resized = cv2.resize(image, (self.input_size, self.input_size), interpolation=cv2.INTER_AREA)
 		rgba = np.concatenate(
 			[cv2.cvtColor(resized, cv2.COLOR_BGR2RGB), np.ones((*resized.shape[:2], 1), dtype=np.uint8)],
@@ -82,16 +83,25 @@ class MLSDWorker:
 			if np.hypot(x2 - x1, y2 - y1) < 8.0:
 				continue
 			lines.append((x1 * width / self.input_size, y1 * height / self.input_size, x2 * width / self.input_size, y2 * height / self.input_size))
-		line_map = np.zeros((height, width), dtype=np.uint8)
+		line_map = np.zeros((height, width, 3), dtype=np.uint8)
+		vertical_line_count = 0
 		for x1, y1, x2, y2 in lines:
-			cv2.line(line_map, (round(x1), round(y1)), (round(x2), round(y2)), 255, 2, cv2.LINE_AA)
+			vertical_deviation = np.degrees(np.arctan2(abs(x2 - x1), max(abs(y2 - y1), 1e-9)))
+			is_vertical = vertical_deviation <= vertical_tolerance_degrees
+			if is_vertical:
+				vertical_line_count += 1
+			color = (0, 255, 0) if is_vertical else (255, 255, 255)
+			cv2.line(line_map, (round(x1), round(y1)), (round(x2), round(y2)), color, 2, cv2.LINE_AA)
 		metadata = {
 			"width": width,
 			"height": height,
 			"line_count": len(lines),
 			"line_pixels": int(np.count_nonzero(line_map)),
+			"vertical_tolerance_degrees": vertical_tolerance_degrees,
+			"vertical_line_count": vertical_line_count,
 			"score_threshold": threshold,
 			"model": "M-LSD",
+			"lines": [[float(value) for value in line] for line in lines],
 			"duration_seconds": time.monotonic() - started,
 		}
 		return {"width": width, "height": height, "line_map_base64": self._encode_png(line_map), "metadata": metadata}

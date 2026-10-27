@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import math
+import multiprocessing
 import os
 import queue
 import requests
@@ -24,6 +25,10 @@ import trimesh
 from botocore.config import Config
 from PIL import Image, ImageOps
 from web_server import ViewerWebServer
+from road_processing import flatten_and_retile_meshes
+from building_geometry import tighten_building_meshes
+from outline_snap import snap_mesh_edges_to_outline
+from global_refinement import refine_meshes
 
 
 ASSET_PATH = Path(__file__).with_name("merged.gltf")
@@ -197,7 +202,8 @@ class ModelWindow(pyglet.window.Window):
 		completion = threading.Event()
 		result: dict[str, object] = {}
 		self.web_commands.put({"command": command, "completion": completion, "result": result})
-		if not completion.wait(timeout=5.0):
+		timeout = 30.0 if command.get("action") in {"load_road_processed", "load_building_geometry"} else 5.0
+		if not completion.wait(timeout=timeout):
 			return {"ok": False, "error": "viewer did not process the command in time"}
 		return result
 
@@ -264,7 +270,36 @@ class ModelWindow(pyglet.window.Window):
 		elif action == "mask2former":
 			self.run_mask2former_for_artifact(int(command["index"]))
 		elif action == "mlsd":
-			self.run_mlsd_for_artifact(int(command["index"]))
+			self.run_mlsd_for_artifact(
+				int(command["index"]),
+				float(command.get("vertical_tolerance_degrees", 10.0)),
+			)
+		elif action == "snap_outline":
+			self.run_outline_snap(int(command["index"]), float(command.get("aggressiveness_m", 0.5)))
+		elif action == "load_outline_snapped":
+			self.load_outline_snapped(int(command["index"]))
+		elif action == "global_refinement":
+			self.run_global_refinement(float(command.get("grid_size_m", 0.1)))
+		elif action == "load_global_refinement":
+			self.load_global_refinement()
+		elif action == "process_road":
+			self.run_road_processing(
+				int(command["index"]),
+				str(command.get("segmentation_source", "mask2former")),
+				bool(command.get("include_road", True)),
+				bool(command.get("include_sidewalk", False)),
+			)
+		elif action == "load_road_processed":
+			self.load_road_processed(int(command["index"]))
+		elif action == "process_building_geometry":
+			self.run_building_geometry(
+				int(command["index"]),
+				str(command.get("segmentation_source", "mask2former")),
+				float(command.get("aggressiveness", 0.65)),
+				bool(command.get("prefer_axis_aligned", True)),
+			)
+		elif action == "load_building_geometry":
+			self.load_building_geometry(int(command["index"]))
 		elif action == "depth_anything":
 			LOGGER.info("Depth Anything web action dispatched: artifact=%s", command.get("index"))
 			self.run_depth_anything_for_artifact(int(command["index"]))
@@ -410,7 +445,7 @@ class ModelWindow(pyglet.window.Window):
 			LOGGER.exception("Depth Anything artifact rerun failed: artifact=%d source=%s", index, image_path)
 			self.set_caption(f"Depth Anything failed for artifact {index + 1}: {exc}")
 
-	def _request_mlsd_lines(self, image_path: Path, index: int) -> tuple[str, dict[str, object]]:
+	def _request_mlsd_lines(self, image_path: Path, index: int, vertical_tolerance_degrees: float) -> tuple[str, dict[str, object]]:
 		with CONFIG_PATH.open(encoding="utf-8") as config_file:
 			config = json.load(config_file)
 		settings = config.get("mlsd_generator", {})
@@ -421,6 +456,7 @@ class ModelWindow(pyglet.window.Window):
 		request = {
 			"image_base64": base64.b64encode(image_path.read_bytes()).decode("ascii"),
 			"score_threshold": float(settings.get("score_threshold", 0.2)),
+			"vertical_tolerance_degrees": max(0.0, min(45.0, float(vertical_tolerance_degrees))),
 		}
 		import pika
 		correlation_id = str(uuid.uuid4())
@@ -459,7 +495,7 @@ class ModelWindow(pyglet.window.Window):
 		(CAPTURES_PATH / line_name).write_bytes(base64.b64decode(result["line_map_base64"]))
 		return line_name, dict(result.get("metadata", {}))
 
-	def run_mlsd_for_artifact(self, index: int) -> None:
+	def run_mlsd_for_artifact(self, index: int, vertical_tolerance_degrees: float = 10.0) -> None:
 		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
 			artifacts = json.load(artifacts_file)
 		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
@@ -473,15 +509,15 @@ class ModelWindow(pyglet.window.Window):
 			raise ValueError(f"outline detection source image does not exist: {image_name}")
 		threading.Thread(
 			target=self._run_mlsd_artifact_worker,
-			args=(index, image_path),
+			args=(index, image_path, vertical_tolerance_degrees),
 			name=f"mlsd-artifact-{index}",
 			daemon=True,
 		).start()
 		self.set_caption(f"Outline detection started for artifact {index + 1}")
 
-	def _run_mlsd_artifact_worker(self, index: int, image_path: Path) -> None:
+	def _run_mlsd_artifact_worker(self, index: int, image_path: Path, vertical_tolerance_degrees: float) -> None:
 		try:
-			line_name, line_metadata = self._request_mlsd_lines(image_path, index)
+			line_name, line_metadata = self._request_mlsd_lines(image_path, index, vertical_tolerance_degrees)
 			with ARTIFACTS_LOCK:
 				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
 					artifacts = json.load(artifacts_file)
@@ -495,6 +531,388 @@ class ModelWindow(pyglet.window.Window):
 		except Exception as exc:
 			self.set_caption(f"Outline detection failed: {exc}")
 			LOGGER.exception("M-LSD outline detection failed for artifact %d", index)
+
+	def run_outline_snap(self, index: int, aggressiveness_m: float = 0.5) -> None:
+		aggressiveness_m = max(0.0, min(1.0, float(aggressiveness_m)))
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		with ARTIFACTS_LOCK:
+			artifacts[index]["outline_snap_status"] = "running"
+			with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+				json.dump(artifacts, artifacts_file, indent=2)
+		process = multiprocessing.get_context("fork").Process(
+			target=self._run_outline_snap_worker,
+			args=(index, aggressiveness_m),
+			name=f"outline-snap-{index}",
+			daemon=True,
+		)
+		process.start()
+		threading.Thread(target=self._reap_road_process, args=(process, index), daemon=True).start()
+		self.set_caption(f"Outline snapping started for artifact {index + 1}")
+
+	def _run_outline_snap_worker(self, index: int, aggressiveness_m: float) -> None:
+		try:
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			artifact = artifacts[index]
+			outline_name = artifact.get("outline_detection_lines")
+			metadata = artifact.get("outline_detection_metadata", {})
+			camera_pose = artifact.get("camera_pose", {})
+			capture_size = camera_pose.get("capture_size", {})
+			lines = metadata.get("lines") if isinstance(metadata, dict) else None
+			if not outline_name or not lines or "matrix" not in camera_pose or not capture_size:
+				raise ValueError("rerun M-LSD first to capture line coordinates and camera metadata")
+			loaded = trimesh.load(ASSET_PATH, file_type="gltf", force="scene")
+			if not isinstance(loaded, trimesh.Scene):
+				loaded = trimesh.Scene(loaded)
+			processed, stats = snap_mesh_edges_to_outline(
+				loaded.dump(concatenate=False),
+				CAPTURES_PATH / str(outline_name),
+				camera_pose["matrix"],
+				capture_size,
+				aggressiveness_m,
+				lines,
+			)
+			if stats["edges_snapped"] == 0:
+				raise ValueError("no front-facing mesh edges fell within the selected snap range")
+			output_name = f"outline_snapped_{index}.glb"
+			trimesh.Scene(processed).export(CAPTURES_PATH / output_name, file_type="glb")
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index].update({
+					"outline_snap_asset": output_name,
+					"outline_snap_status": "completed",
+					"outline_snap_stats": stats,
+					"outline_snap_aggressiveness_m": aggressiveness_m,
+				})
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+		except Exception as exc:
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				if isinstance(artifacts, list) and 0 <= index < len(artifacts):
+					artifacts[index]["outline_snap_status"] = "failed"
+					artifacts[index]["outline_snap_error"] = str(exc)
+					with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+						json.dump(artifacts, artifacts_file, indent=2)
+			LOGGER.exception("Outline snapping failed for artifact %d", index)
+
+	def load_outline_snapped(self, index: int) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		asset_name = artifacts[index].get("outline_snap_asset")
+		if not asset_name or not (CAPTURES_PATH / str(asset_name)).is_file():
+			raise ValueError("artifact has no snapped outline mesh")
+		new_scene, new_camera = load_scene(CAPTURES_PATH / str(asset_name))
+		self.render_scene = new_scene
+		self.camera = new_camera
+		self._material_state = {}
+		self._visible_face_cache_key = None
+		self._visible_face_base_meshes = None
+		self.show_visible_faces = False
+		self.set_texture_mode(True)
+		self.orbit_target = new_scene._orbit_center.copy()
+		self.distance = new_scene._orbit_extent * 2.4
+		self.update_camera()
+		self.navigate_to_artifact(index)
+		self.set_caption(f"Outline-snapped mesh loaded for artifact {index + 1}")
+
+	def run_global_refinement(self, grid_size_m: float = 0.1) -> None:
+		grid_size_m = max(0.0, min(5.0, float(grid_size_m)))
+		process = multiprocessing.get_context("fork").Process(
+			target=self._run_global_refinement_worker,
+			args=(grid_size_m,),
+			name="global-refinement",
+			daemon=True,
+		)
+		process.start()
+		LOGGER.info("Global refinement process started: pid=%d grid_size_m=%.3f", process.pid, grid_size_m)
+		threading.Thread(target=self._reap_road_process, args=(process, -1), daemon=True).start()
+		self.set_caption("Global refinement started")
+
+	def _run_global_refinement_worker(self, grid_size_m: float) -> None:
+		try:
+			loaded = trimesh.load(ASSET_PATH, file_type="gltf", force="scene")
+			if not isinstance(loaded, trimesh.Scene):
+				loaded = trimesh.Scene(loaded)
+			processed, stats = refine_meshes(loaded.dump(concatenate=False), grid_size_m)
+			output_name = "global_refinement.glb"
+			trimesh.Scene(processed).export(CAPTURES_PATH / output_name, file_type="glb")
+			LOGGER.info("Global refinement completed: file=%s stats=%s", output_name, stats)
+		except Exception:
+			LOGGER.exception("Global refinement failed")
+
+	def load_global_refinement(self) -> None:
+		asset_path = CAPTURES_PATH / "global_refinement.glb"
+		if not asset_path.is_file():
+			raise ValueError("global refinement output does not exist")
+		new_scene, new_camera = load_scene(asset_path)
+		self.render_scene = new_scene
+		self.camera = new_camera
+		self._material_state = {}
+		self._visible_face_cache_key = None
+		self._visible_face_base_meshes = None
+		self.show_visible_faces = False
+		self.set_texture_mode(True)
+		self.orbit_target = new_scene._orbit_center.copy()
+		self.distance = new_scene._orbit_extent * 2.4
+		self.update_camera()
+		self.set_caption("Global-refined mesh loaded")
+
+	def run_road_processing(
+		self, index: int, segmentation_source: str, include_road: bool, include_sidewalk: bool
+	) -> None:
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		if segmentation_source not in {"segformer", "mask2former"}:
+			raise ValueError("segmentation source must be segformer or mask2former")
+		if not include_road and not include_sidewalk:
+			raise ValueError("select road or sidewalk")
+		with ARTIFACTS_LOCK:
+			artifacts[index]["road_processing_status"] = "running"
+			with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+				json.dump(artifacts, artifacts_file, indent=2)
+		road_process = multiprocessing.get_context("fork").Process(
+			target=self._run_road_processing_worker,
+			args=(index, segmentation_source, include_road, include_sidewalk),
+			name=f"road-processing-{index}",
+			daemon=True,
+		)
+		road_process.start()
+		LOGGER.info("Road worker process started: artifact=%d pid=%d", index, road_process.pid)
+		threading.Thread(
+			target=self._reap_road_process,
+			args=(road_process, index),
+			name=f"road-process-reaper-{index}",
+			daemon=True,
+		).start()
+		self.set_caption(f"Road processing started for artifact {index + 1}")
+
+	@staticmethod
+	def _reap_road_process(process: multiprocessing.Process, index: int) -> None:
+		process.join()
+		LOGGER.info("Road worker process exited: artifact=%d pid=%s exitcode=%s", index, process.pid, process.exitcode)
+		process.close()
+
+	def _run_road_processing_worker(
+		self, index: int, segmentation_source: str, include_road: bool, include_sidewalk: bool
+	) -> None:
+		started = time.perf_counter()
+		try:
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			artifact = artifacts[index]
+			mask_field = "segmentation_masks" if segmentation_source == "segformer" else "mask2former_masks"
+			mask_groups = {
+				category: [
+					str(name) for name in artifact.get(mask_field, [])
+					if f"_{category}_" in f"_{str(name).lower()}_" and (CAPTURES_PATH / str(name)).is_file()
+				]
+				for category, enabled in (("road", include_road), ("sidewalk", include_sidewalk))
+				if enabled
+			}
+			mask_names = [name for names in mask_groups.values() for name in names]
+			LOGGER.info(
+				"Road worker inputs: artifact=%d source=%s categories=%s masks=%s",
+				index, segmentation_source, list(mask_groups), mask_names,
+			)
+			camera_pose = artifact.get("camera_pose", {})
+			capture_size = camera_pose.get("capture_size", {})
+			if not mask_names or "matrix" not in camera_pose or not capture_size:
+				raise ValueError("artifact is missing the selected segmentation masks, camera matrix, or capture size")
+			loaded = trimesh.load(ASSET_PATH, file_type="gltf", force="scene")
+			if not isinstance(loaded, trimesh.Scene):
+				loaded = trimesh.Scene(loaded)
+			meshes = loaded.dump(concatenate=False)
+			LOGGER.info("Road source mesh loaded: artifact=%d meshes=%d elapsed=%.2fs", index, len(meshes), time.perf_counter() - started)
+			processed_meshes, stats = flatten_and_retile_meshes(
+				meshes,
+				{category: [CAPTURES_PATH / name for name in names] for category, names in mask_groups.items()},
+				camera_pose["matrix"],
+				capture_size,
+			)
+			if stats["triangles_removed"] == 0 or stats["triangles_added"] == 0:
+				raise ValueError("selected masks did not produce a retiled road boundary")
+			output_name = f"road_processed_{index}.glb"
+			LOGGER.info("Road export started: artifact=%d output_meshes=%d stats=%s", index, len(processed_meshes), stats)
+			trimesh.Scene(processed_meshes).export(CAPTURES_PATH / output_name, file_type="glb")
+			LOGGER.info("Road export finished: file=%s bytes=%d elapsed=%.2fs", output_name, (CAPTURES_PATH / output_name).stat().st_size, time.perf_counter() - started)
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index]["road_processing_asset"] = output_name
+				artifacts[index]["road_processing_status"] = "completed"
+				artifacts[index]["road_processing_segmentation_source"] = segmentation_source
+				artifacts[index]["road_processing_masks"] = mask_names
+				artifacts[index]["road_processing_stats"] = stats
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			LOGGER.info("Road worker completed: artifact=%d elapsed=%.2fs", index, time.perf_counter() - started)
+		except Exception as exc:
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				if isinstance(artifacts, list) and 0 <= index < len(artifacts):
+					artifacts[index]["road_processing_status"] = "failed"
+					artifacts[index]["road_processing_error"] = str(exc)
+					with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+						json.dump(artifacts, artifacts_file, indent=2)
+			LOGGER.exception("Road processing failed for artifact %d", index)
+
+	def load_road_processed(self, index: int) -> None:
+		started = time.perf_counter()
+		LOGGER.info("Road deployment started: artifact=%d", index)
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		asset_name = artifacts[index].get("road_processing_asset")
+		if not asset_name:
+			raise ValueError("artifact has no processed road mesh")
+		asset_path = CAPTURES_PATH / str(asset_name)
+		if not asset_path.is_file():
+			raise ValueError("processed road mesh does not exist")
+		new_scene, new_camera = load_scene(asset_path)
+		LOGGER.info("Road deployment asset loaded: file=%s meshes=%d elapsed=%.2fs", asset_path.name, len(new_scene._walk_meshes), time.perf_counter() - started)
+		self.render_scene = new_scene
+		self.camera = new_camera
+		self._material_state = {}
+		self._visible_face_cache_key = None
+		self._visible_face_base_meshes = None
+		self.show_visible_faces = False
+		self.set_texture_mode(True)
+		self.orbit_target = new_scene._orbit_center.copy()
+		self.distance = new_scene._orbit_extent * 2.4
+		self.update_camera()
+		self.navigate_to_artifact(index)
+		self.set_caption(f"Road-processed mesh loaded for artifact {index + 1}")
+		LOGGER.info("Road deployment completed: artifact=%d elapsed=%.2fs", index, time.perf_counter() - started)
+
+	def run_building_geometry(
+		self,
+		index: int,
+		segmentation_source: str,
+		aggressiveness: float = 0.65,
+		prefer_axis_aligned: bool = True,
+	) -> None:
+		if segmentation_source not in {"segformer", "mask2former"}:
+			raise ValueError("segmentation source must be segformer or mask2former")
+		aggressiveness = max(0.0, min(2.0, float(aggressiveness)))
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		with ARTIFACTS_LOCK:
+			artifacts[index]["building_geometry_status"] = "running"
+			with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+				json.dump(artifacts, artifacts_file, indent=2)
+		process = multiprocessing.get_context("fork").Process(
+			target=self._run_building_geometry_worker,
+			args=(index, segmentation_source, aggressiveness, prefer_axis_aligned),
+			name=f"building-geometry-{index}",
+			daemon=True,
+		)
+		process.start()
+		LOGGER.info("Building geometry process started: artifact=%d pid=%d source=%s aggressiveness=%.2f axis_aligned=%s", index, process.pid, segmentation_source, aggressiveness, prefer_axis_aligned)
+		threading.Thread(target=self._reap_building_process, args=(process, index), daemon=True).start()
+		self.set_caption(f"Building geometry started for artifact {index + 1}")
+
+	@staticmethod
+	def _reap_building_process(process: multiprocessing.Process, index: int) -> None:
+		process.join()
+		LOGGER.info("Building geometry process exited: artifact=%d pid=%s exitcode=%s", index, process.pid, process.exitcode)
+		process.close()
+
+	def _run_building_geometry_worker(
+		self,
+		index: int,
+		segmentation_source: str,
+		aggressiveness: float,
+		prefer_axis_aligned: bool,
+	) -> None:
+		started = time.perf_counter()
+		try:
+			with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+				artifacts = json.load(artifacts_file)
+			artifact = artifacts[index]
+			field = "segmentation_masks" if segmentation_source == "segformer" else "mask2former_masks"
+			mask_names = [
+				str(name) for name in artifact.get(field, [])
+				if "_building_" in f"_{str(name).lower()}_" and (CAPTURES_PATH / str(name)).is_file()
+			]
+			camera_pose = artifact.get("camera_pose", {})
+			capture_size = camera_pose.get("capture_size", {})
+			if not mask_names or "matrix" not in camera_pose or not capture_size:
+				raise ValueError("artifact is missing the selected building mask, camera matrix, or capture size")
+			loaded = trimesh.load(ASSET_PATH, file_type="gltf", force="scene")
+			if not isinstance(loaded, trimesh.Scene):
+				loaded = trimesh.Scene(loaded)
+			meshes = loaded.dump(concatenate=False)
+			processed_meshes, stats = tighten_building_meshes(
+				meshes,
+				[CAPTURES_PATH / name for name in mask_names],
+				camera_pose["matrix"],
+				capture_size,
+				aggressiveness,
+				prefer_axis_aligned,
+			)
+			if stats["planes_fitted"] == 0:
+				raise ValueError("building mask did not select enough mesh geometry for plane fitting")
+			output_name = f"building_geometry_{index}.glb"
+			trimesh.Scene(processed_meshes).export(CAPTURES_PATH / output_name, file_type="glb")
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				artifacts[index].update({
+					"building_geometry_asset": output_name,
+					"building_geometry_status": "completed",
+					"building_geometry_segmentation_source": segmentation_source,
+					"building_geometry_masks": mask_names,
+					"building_geometry_stats": stats,
+				})
+				with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+					json.dump(artifacts, artifacts_file, indent=2)
+			LOGGER.info("Building geometry completed: artifact=%d file=%s stats=%s elapsed=%.2fs", index, output_name, stats, time.perf_counter() - started)
+		except Exception as exc:
+			with ARTIFACTS_LOCK:
+				with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+					artifacts = json.load(artifacts_file)
+				if isinstance(artifacts, list) and 0 <= index < len(artifacts):
+					artifacts[index]["building_geometry_status"] = "failed"
+					artifacts[index]["building_geometry_error"] = str(exc)
+					with ARTIFACTS_PATH.open("w", encoding="utf-8") as artifacts_file:
+						json.dump(artifacts, artifacts_file, indent=2)
+			LOGGER.exception("Building geometry failed for artifact %d", index)
+
+	def load_building_geometry(self, index: int) -> None:
+		started = time.perf_counter()
+		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:
+			artifacts = json.load(artifacts_file)
+		if not isinstance(artifacts, list) or index < 0 or index >= len(artifacts):
+			raise ValueError("artifact index is out of range")
+		asset_name = artifacts[index].get("building_geometry_asset")
+		if not asset_name or not (CAPTURES_PATH / str(asset_name)).is_file():
+			raise ValueError("artifact has no deployed building geometry")
+		new_scene, new_camera = load_scene(CAPTURES_PATH / str(asset_name))
+		self.render_scene = new_scene
+		self.camera = new_camera
+		self._material_state = {}
+		self._visible_face_cache_key = None
+		self._visible_face_base_meshes = None
+		self.show_visible_faces = False
+		self.set_texture_mode(True)
+		self.orbit_target = new_scene._orbit_center.copy()
+		self.distance = new_scene._orbit_extent * 2.4
+		self.update_camera()
+		self.navigate_to_artifact(index)
+		self.set_caption(f"Building geometry loaded for artifact {index + 1}")
+		LOGGER.info("Building geometry deployed: artifact=%d meshes=%d elapsed=%.2fs", index, len(new_scene._walk_meshes), time.perf_counter() - started)
 
 	def run_segmentation_for_artifact(self, index: int) -> None:
 		with ARTIFACTS_PATH.open(encoding="utf-8") as artifacts_file:

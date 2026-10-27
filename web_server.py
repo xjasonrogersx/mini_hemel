@@ -362,6 +362,36 @@ class ViewerWebServer:
             f'<ul>{detection_rows}</ul>' if detection_rows else '<p class="muted">No detections yet.</p>'
         )
         dino_image = artifact.get("result_render") or ""
+        road_stats = artifact.get("road_processing_stats", {})
+        road_processing_status = str(artifact.get("road_processing_status") or "not started")
+        road_processing_asset = artifact.get("road_processing_asset")
+        road_processing_stats = road_stats if isinstance(road_stats, dict) else {}
+        road_category_stats = road_processing_stats.get("categories", {})
+        road_category_summary = " · ".join(
+            f"{category}: {values.get('triangles', 0)} triangles"
+            for category, values in road_category_stats.items()
+            if isinstance(values, dict)
+        ) or "No category results yet"
+        building_geometry_status = str(artifact.get("building_geometry_status") or "not started")
+        building_geometry_asset = artifact.get("building_geometry_asset")
+        building_mask_sources = {
+            "segformer": [
+                str(name) for name in artifact.get("segmentation_masks", [])
+                if "_building_" in f"_{str(name).lower()}_"
+                and (self.captures_path / str(name)).is_file()
+            ],
+            "mask2former": [
+                str(name) for name in artifact.get("mask2former_masks", [])
+                if "_building_" in f"_{str(name).lower()}_"
+                and (self.captures_path / str(name)).is_file()
+            ],
+        }
+        building_mask_summary = " · ".join(
+            f"{source}: {len(names)} building mask(s)"
+            for source, names in building_mask_sources.items()
+        ) or "No building masks available yet"
+        outline_snap_status = str(artifact.get("outline_snap_status") or "not started")
+        outline_snap_asset = artifact.get("outline_snap_asset")
         pose = artifact.get("camera_pose", {})
         page = ARTIFACT_PAGE_HTML.format(
             index=index,
@@ -378,6 +408,29 @@ class ViewerWebServer:
             fields=json.dumps({field: filename for field, _label, filename in available}),
             detection_report=detection_report,
             outline_status=html.escape(str(artifact.get("outline_detection_status", "not started"))),
+            outline_snap_status=html.escape(outline_snap_status),
+            outline_snap_asset_label=html.escape(f" · {outline_snap_asset}" if outline_snap_asset else ""),
+            outline_snap_deploy_button=(
+                '<button onclick="loadOutlineSnapped()">Deploy snapped mesh</button>'
+                if outline_snap_asset else ""
+            ),
+            road_processing_status=html.escape(road_processing_status),
+            road_processing_asset=html.escape(str(road_processing_asset or "")),
+            road_processing_asset_label=html.escape(f" · {road_processing_asset}" if road_processing_asset else ""),
+            road_processing_deploy_button=(
+                '<button onclick="loadRoadProcessed()">Deploy processed mesh</button>'
+                if road_processing_asset else ""
+            ),
+            road_category_summary=html.escape(road_category_summary),
+            road_triangles_removed=road_processing_stats.get("triangles_removed", 0),
+            road_triangles_added=road_processing_stats.get("triangles_added", 0),
+            building_geometry_status=html.escape(building_geometry_status),
+            building_geometry_asset_label=html.escape(f" · {building_geometry_asset}" if building_geometry_asset else ""),
+            building_geometry_deploy_button=(
+                '<button onclick="loadBuildingGeometry()">Deploy building geometry</button>'
+                if building_geometry_asset else ""
+            ),
+            building_mask_summary=html.escape(building_mask_summary),
             dino_image=html.escape(dino_image),
             detections_json=json.dumps(detections),
             detection_targets=json.dumps([
@@ -416,7 +469,9 @@ button,select,input {{ border:1px solid var(--line); background:var(--panel); bo
 </style></head><body><main>
 <div class="head"><div><a href="/">&larr; All artifacts</a><h1>{title}</h1><div class="muted">{generator} &middot; {created_at}</div></div><div class="muted">yaw {yaw} &middot; pitch {pitch} &middot; distance {distance}</div></div>
 <p><button onclick="navigate()">Navigate display to this pose</button> <button onclick="segment()">Run / rerun SegFormer</button> <button onclick="mask2former()">Run / rerun Mask2Former</button> <button onclick="depthAnything()">Run / rerun Depth Anything on generated result</button> <span id="status" class="status"></span></p>
-<section class="operation"><h2>Outline detection</h2><p class="muted">Runs M-LSD on the generated or source image and saves the detected architectural line map for comparison.</p><p class="muted">Status: {outline_status}</p><p><button onclick="runMlsd()">Run / rerun outline detection</button></p></section>
+<section class="operation"><h2>Outline detection</h2><p class="muted">Runs M-LSD on the generated or source image and saves the detected architectural line map for comparison. Vertical lines within the selected tolerance are drawn green; other lines remain white.</p><p class="muted">Status: {outline_status}</p><div class="controls"><label for="verticalTolerance">Vertical tolerance</label><input id="verticalTolerance" class="range" type="range" min="0" max="45" value="10" step="1" oninput="verticalToleranceValue.value=this.value"><output id="verticalToleranceValue">10</output>°<button onclick="runMlsd()">Run / rerun outline detection</button></div><hr><p class="muted">Snap front-facing triangle edges toward captured M-LSD lines. Each affected vertex uses the average of its snap proposals.</p><p class="muted">Snap status: {outline_snap_status}{outline_snap_asset_label}</p><div class="controls"><label for="outlineSnapRange">Snap range</label><input id="outlineSnapRange" class="range" type="range" min="0" max="1" value="0.5" step="0.05" oninput="outlineSnapRangeValue.value=Number(this.value).toFixed(2)"><output id="outlineSnapRangeValue">0.50</output> m<button onclick="snapOutline()">Snap to vertical</button>{outline_snap_deploy_button}</div></section>
+<section class="operation"><h2>Building geometry</h2><p class="muted">Tightens visible building geometry with mask-guided plane fitting. Roads and sidewalks are excluded.</p><p class="muted">Status: {building_geometry_status}{building_geometry_asset_label}</p><div class="controls"><label for="buildingSegmentationSource">Segmentation</label><select id="buildingSegmentationSource"><option value="mask2former" selected>Mask2Former</option><option value="segformer">SegFormer</option></select><label for="buildingAggressiveness">Aggressiveness</label><input id="buildingAggressiveness" class="range" type="range" min="0" max="200" value="65" step="5" oninput="buildingAggressivenessValue.value=this.value"><output id="buildingAggressivenessValue">65</output>%<label><input id="preferAxisAligned" type="checkbox" checked> prefer vertical / horizontal planes</label><button onclick="processBuildingGeometry()">Run building geometry test</button>{building_geometry_deploy_button}</div><p class="muted">{building_mask_summary}</p></section>
+<section class="operation"><h2>Road processing</h2><p class="muted">Select segmentation masks, remove the selected road surface, flatten the boundary plane, and retile the opening along the segmentation boundary.</p><p class="muted">Status: {road_processing_status}{road_processing_asset_label}</p><div class="controls"><label for="roadSegmentationSource">Segmentation</label><select id="roadSegmentationSource"><option value="mask2former" selected>Mask2Former</option><option value="segformer">SegFormer</option></select><label><input id="includeRoad" type="checkbox" checked> road</label><label><input id="includeSidewalk" type="checkbox"> sidewalk</label><button onclick="processRoad()">Process road</button>{road_processing_deploy_button}</div><p class="muted">{road_category_summary} · source triangles replaced: {road_triangles_removed} · total clipped triangles: {road_triangles_added}</p></section>
 <h2>Artifact images</h2><div class="images">{images}</div>
 <h2>Compare images from this artifact</h2><div class="controls"><label for="imageA">Image A</label><select id="imageA" onchange="updateCompare()">{options}</select><label for="imageB">Image B</label><select id="imageB" onchange="updateCompare()">{options}</select></div>
 <div class="stage"><img id="bottom" src="/captures/{first_image}" alt="Image B"><img id="top" class="top" src="/captures/{second_image}" alt="Image A"><div id="divider" class="divider"></div></div><label for="slider">Swipe position</label><br><input id="slider" class="range" type="range" min="0" max="100" value="50" oninput="updateCompare()">
@@ -426,7 +481,13 @@ async function navigate() {{ const status=document.getElementById('status'); sta
 async function segment() {{ const status=document.getElementById('status'); status.textContent='Starting SegFormer...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'segment',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'SegFormer started; refresh this page when complete':data.error; }}
 async function mask2former() {{ const status=document.getElementById('status'); status.textContent='Starting Mask2Former...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'mask2former',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Mask2Former started; refresh this page when complete':data.error; }}
 async function depthAnything() {{ const status=document.getElementById('status'); status.textContent='Starting Depth Anything on generated result...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'depth_anything',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Depth Anything started on generated result; refresh this page when complete':data.error; }}
-async function runMlsd() {{ const status=document.getElementById('status'); status.textContent='Starting outline detection...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'mlsd',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Outline detection started; refresh this page when complete':data.error; }}
+async function runMlsd() {{ const status=document.getElementById('status'); status.textContent='Starting outline detection...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'mlsd',index:{index},vertical_tolerance_degrees:Number(document.getElementById('verticalTolerance').value)}})}}); const data=await response.json(); status.textContent=data.ok?'Outline detection started; refresh this page when complete':data.error; }}
+async function snapOutline() {{ const status=document.getElementById('status'); status.textContent='Starting outline snap...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'snap_outline',index:{index},aggressiveness_m:Number(document.getElementById('outlineSnapRange').value)}})}}); const data=await response.json(); status.textContent=data.ok?'Outline snap started; refresh this page when complete':data.error; }}
+async function loadOutlineSnapped() {{ const status=document.getElementById('status'); status.textContent='Deploying snapped mesh...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'load_outline_snapped',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Snapped mesh loaded':data.error; }}
+async function processRoad() {{ const status=document.getElementById('status'); const includeRoad=document.getElementById('includeRoad').checked; const includeSidewalk=document.getElementById('includeSidewalk').checked; if(!includeRoad&&!includeSidewalk) {{ status.textContent='Select road or sidewalk first'; return; }} status.textContent='Starting road processing...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'process_road',index:{index},segmentation_source:document.getElementById('roadSegmentationSource').value,include_road:includeRoad,include_sidewalk:includeSidewalk}})}}); const data=await response.json(); status.textContent=data.ok?'Road processing started; refresh this page when complete':data.error; }}
+async function loadRoadProcessed() {{ const status=document.getElementById('status'); status.textContent='Deploying processed road mesh...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'load_road_processed',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Processed road mesh loaded':data.error; }}
+async function processBuildingGeometry() {{ const status=document.getElementById('status'); status.textContent='Starting building geometry...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'process_building_geometry',index:{index},segmentation_source:document.getElementById('buildingSegmentationSource').value,aggressiveness:Number(document.getElementById('buildingAggressiveness').value)/100,prefer_axis_aligned:document.getElementById('preferAxisAligned').checked}})}}); const data=await response.json(); status.textContent=data.ok?'Building geometry started; refresh this page when complete':data.error; }}
+async function loadBuildingGeometry() {{ const status=document.getElementById('status'); status.textContent='Deploying building geometry...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'load_building_geometry',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'Building geometry loaded':data.error; }}
 async function groundingDino() {{ const status=document.getElementById('status'); status.textContent='Starting Grounding DINO...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'grounding_dino',index:{index},prompt:document.getElementById('dinoPrompt').value}})}}); const data=await response.json(); status.textContent=data.ok?'Grounding DINO started; refresh this page when complete':data.error; }}
 async function sam2All() {{ const status=document.getElementById('status'); status.textContent='Starting SAM2 for all boxes...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'sam2_all',index:{index}}})}}); const data=await response.json(); status.textContent=data.ok?'SAM2 started for all boxes; refresh this page when complete':data.error; }}
 async function deleteDino(entryIndex) {{ const target=detectionTargets[entryIndex]; if(!target || !window.confirm('Delete this Grounding DINO detection?')) return; const status=document.getElementById('status'); status.textContent='Deleting detection...'; const response=await fetch('/api/control',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{action:'delete_dino_detection',index:{index},prompt:target.prompt,detection_index:target.detection_index}})}}); const data=await response.json(); if(data.ok) window.location.reload(); else status.textContent=data.error; }}
@@ -482,6 +543,7 @@ article { background:var(--panel); border:1px solid var(--line); border-radius:6
  <span class="status" id="status"></span>
 </section>
 <section><h2>Texture options</h2><div class="toolbar"><label for="prompt">Prompt</label><input id="prompt"><label for="resolution">Resolution</label><select id="resolution"><option>1k</option><option>2k</option><option>4k</option></select><label for="aspect">Aspect</label><select id="aspect"><option>4:3</option><option>16:9</option><option>1:1</option></select><button onclick="saveOptions()">Save options</button></div></section>
+<section class="points-panel"><h2>Global refinement</h2><p class="point-help">Quantizes the full scene to a grid and removes redundant coincident vertices. A larger grid makes the cleanup more aggressive.</p><div class="toolbar"><label for="globalRefinementGrid">Grid quantization</label><input id="globalRefinementGrid" type="range" min="0" max="5" value="0.1" step="0.1" oninput="globalRefinementGridValue.value=Number(this.value).toFixed(1)"><output id="globalRefinementGridValue">0.1</output> m<button onclick="runGlobalRefinement()">Run global refinement</button><button onclick="loadGlobalRefinement()">Deploy refined mesh</button></div></section>
 <section class="points-panel"><h2>Point list</h2><p class="point-help">Press <strong>P</strong> in the viewer, then click a visible surface. Enter coordinates as latitude, longitude, for example 51.757353, -0.472765.</p><div class="toolbar"><button onclick="armPointMode()">Arm point mode</button><button onclick="clearPoints()">Clear points</button><span id="pointMode" class="status"></span></div><div id="points"><div class="empty">No points recorded.</div></div><div class="mapping"><label for="queryX">Model X</label><input id="queryX" type="number" step="any" oninput="updateMapping()"><label for="queryZ">Model Z</label><input id="queryZ" type="number" step="any" oninput="updateMapping()"><span id="mappingResult" class="mapping-result"></span></div></section>
 <section><h2>Generated assets</h2><div class="assets" id="assets"><div class="empty">Loading artifacts...</div></div></section>
 </main>
@@ -497,6 +559,8 @@ async function toggleTexture(){ try { await post({action:'toggle_texture'}); not
 async function generate(generator){ try { await post({action:'generate',generator}); notice('Generation started'); } catch(e){notice(e.message)} }
 async function saveView(){ try { await post({action:'save_view'}); notice('View capture started'); } catch(e){notice(e.message)} }
 async function saveOptions(){ try { await post({action:'set_options',options:{prompt:$('prompt').value,resolution:$('resolution').value,aspect_ratio:$('aspect').value}}); notice('Options saved'); } catch(e){notice(e.message)} }
+async function runGlobalRefinement(){ try { await post({action:'global_refinement',grid_size_m:Number($('globalRefinementGrid').value)}); notice('Global refinement started; deploy when complete'); } catch(e){notice(e.message)} }
+async function loadGlobalRefinement(){ try { await post({action:'load_global_refinement'}); notice('Global-refined mesh loaded'); } catch(e){notice(e.message)} }
 async function armPointMode(){ try { await post({action:'arm_point_mode'}); notice('Point mode armed in viewer'); } catch(e){notice(e.message)} }
 async function clearPoints(){ try { await post({action:'clear_points'}); notice('Point list cleared'); load(); } catch(e){notice(e.message)} }
 async function deletePoint(index){ try { await post({action:'delete_point',index}); stateCache.points.splice(index,1); renderPoints(stateCache.points); notice('Point deleted'); } catch(e){notice(e.message)} }
